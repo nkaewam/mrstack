@@ -23,10 +23,6 @@ type capturedSnapshot struct {
 }
 
 func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (cli.Result, error) {
-	if inv.Selector.StackID != "" {
-		return cli.Result{}, cli.Invalid("invalid_selector",
-			"--stack selection requires history services, which are not safely implemented")
-	}
 	rc, err := h.repository(ctx, inv.Globals.Remote, true)
 	if err != nil {
 		return cli.Result{}, err
@@ -71,6 +67,10 @@ func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (
 	if !fullOID(baseSHA) {
 		return cli.Result{}, cli.Unavailable("git_transport_failed",
 			"the default branch revision could not be resolved", true)
+	}
+	if completion, handled, completionErr := h.reconcileTrackedCompletion(
+		ctx, inv, rc, mrs, baseSHA, persist); handled {
+		return completion, completionErr
 	}
 
 	selector := stack.Selector{}
@@ -160,17 +160,52 @@ func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (
 		if raw.HeadPipeline == nil {
 			continue
 		}
-		p := raw.HeadPipeline
-		pid, parseErr := strconv.ParseInt(p.ID.String(), 10, 64)
+		head := raw.HeadPipeline
+		pid, parseErr := strconv.ParseInt(head.ID.String(), 10, 64)
 		if parseErr != nil {
 			continue
 		}
+		p, pipelineErr := rc.client.Pipeline(ctx, rc.project.ID.String(), head.ID.String())
+		if pipelineErr != nil {
+			return cli.Result{}, classifyGlab("read pipeline evidence", pipelineErr)
+		}
+		kind := classifyPipelineKind(p, member.IID)
 		domainPipeline := stack.Pipeline{
-			ID: pid, MRIID: member.IID, Kind: stack.PipelineBranch,
-			SourceSHA: strings.ToLower(p.SHA), Status: p.Status,
+			ID: pid, MRIID: member.IID, Kind: kind,
+			SHA: strings.ToLower(p.SHA), SourceSHA: strings.ToLower(p.SHA),
+			Status: p.Status, WebURL: p.WebURL,
+		}
+		if p.ID.String() != head.ID.String() {
+			domainPipeline.Kind = stack.PipelineUnknown
+		}
+		if kind != stack.PipelineUnknown {
+			associated, associationErr := rc.client.PipelineMergeRequests(
+				ctx, rc.project.ID.String(), head.ID.String())
+			if associationErr != nil {
+				return cli.Result{}, classifyGlab("read pipeline merge request association", associationErr)
+			}
+			domainPipeline.AssociatedWithMR = pipelineAssociatedExactly(associated, member.IID)
+		}
+		if kind == stack.PipelineMergedResult {
+			// A merged-results pipeline runs against a synthetic commit, not
+			// the source branch tip. Its exact source currentness is proven by
+			// the immutable two-parent commit evidence below.
+			domainPipeline.SourceSHA = member.SourceSHA
+			if fullOID(p.SHA) {
+				commit, commitErr := rc.client.Commit(ctx, rc.project.ID.String(), p.SHA)
+				if commitErr != nil {
+					return cli.Result{}, classifyGlab("read merged-results commit evidence", commitErr)
+				}
+				if strings.EqualFold(commit.ID, p.SHA) {
+					for _, parent := range commit.ParentIDs {
+						domainPipeline.SyntheticParents = append(
+							domainPipeline.SyntheticParents, strings.ToLower(parent))
+					}
+				}
+			}
 		}
 		if p.Status == "failed" || p.Status == "canceled" {
-			jobs, jobsErr := rc.client.PipelineJobs(ctx, rc.project.ID.String(), p.ID.String())
+			jobs, jobsErr := rc.client.PipelineJobs(ctx, rc.project.ID.String(), head.ID.String())
 			if jobsErr != nil {
 				return cli.Result{}, classifyGlab("read failed pipeline jobs", jobsErr)
 			}
@@ -179,7 +214,7 @@ func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (
 					id, idErr := strconv.ParseInt(job.ID.String(), 10, 64)
 					if idErr == nil {
 						domainPipeline.FailedJobIDs = append(domainPipeline.FailedJobIDs, id)
-						jobsByPipeline[p.ID.String()] = append(jobsByPipeline[p.ID.String()], api.FailedJob{
+						jobsByPipeline[head.ID.String()] = append(jobsByPipeline[head.ID.String()], api.FailedJob{
 							ID: job.ID.String(), Name: job.Name, Status: job.Status, WebURL: job.WebURL,
 						})
 					}
@@ -309,6 +344,25 @@ func fetchBranches(ctx context.Context, rc repositoryContext, branches map[strin
 	return err
 }
 
+func classifyPipelineKind(p gitlab.Pipeline, memberIID int) stack.PipelineKind {
+	if p.Source != "merge_request_event" {
+		return stack.PipelineBranch
+	}
+	prefix := "refs/merge-requests/" + strconv.Itoa(memberIID) + "/"
+	switch p.Ref {
+	case prefix + "head":
+		return stack.PipelineDetachedMR
+	case prefix + "merge":
+		return stack.PipelineMergedResult
+	default:
+		return stack.PipelineUnknown
+	}
+}
+
+func pipelineAssociatedExactly(requests []gitlab.PipelineMergeRequest, memberIID int) bool {
+	return len(requests) == 1 && requests[0].IID == memberIID
+}
+
 func buildAPIStack(observedAt string, rc repositoryContext, selector api.Selector, mode stack.Mode,
 	discovered stack.Stack, alignment stack.AlignmentResult, raw []gitlab.MergeRequest,
 	byIID map[int]int, pipelines []stack.Pipeline, jobs map[string][]api.FailedJob,
@@ -329,10 +383,15 @@ func buildAPIStack(observedAt string, rc repositoryContext, selector api.Selecto
 		Members: []api.Member{},
 	}
 	pipelineByMR := map[int]stack.Pipeline{}
-	for _, p := range pipelines {
-		for _, member := range discovered.Members {
-			if member.IID == p.MRIID && member.SourceSHA == p.SourceSHA {
-				pipelineByMR[p.MRIID] = p
+	for _, member := range discovered.Members {
+		assessment := stack.AssessCI(member, policy, pipelines)
+		if !assessment.Applicable {
+			continue
+		}
+		for _, p := range pipelines {
+			if p.ID == assessment.PipelineID {
+				pipelineByMR[member.IID] = p
+				break
 			}
 		}
 	}
@@ -384,14 +443,17 @@ func buildAPIStack(observedAt string, rc repositoryContext, selector api.Selecto
 			apiMember.TargetResolution = "integrated_predecessor"
 		}
 		if p, ok := pipelineByMR[member.IID]; ok {
-			id, sha := strconv.FormatInt(p.ID, 10), p.SourceSHA
-			kind, webURL, status := string(p.Kind), "", p.Status
+			id, sha, sourceSHA := strconv.FormatInt(p.ID, 10), p.SHA, p.SourceSHA
+			if !fullOID(sha) {
+				sha = sourceSHA
+			}
+			kind, webURL, status := string(p.Kind), p.WebURL, p.Status
 			if kind == "detached_merge_request" {
 				kind = "detached_mr"
 			} else if kind == "merged_result" {
 				kind = "merged_results"
 			}
-			if mr.HeadPipeline != nil {
+			if webURL == "" && mr.HeadPipeline != nil {
 				webURL = mr.HeadPipeline.WebURL
 			}
 			applicability := "unknown"
@@ -402,12 +464,17 @@ func buildAPIStack(observedAt string, rc repositoryContext, selector api.Selecto
 			if failedJobs == nil {
 				failedJobs = []api.FailedJob{}
 			}
-			apiMember.Pipeline = &api.Pipeline{
+			apiPipeline := &api.Pipeline{
 				Applicability: applicability, Currentness: "exact", Kind: &kind,
-				ID: &id, SHA: &sha, SourceSHA: &sha,
+				ID: &id, SHA: &sha, SourceSHA: &sourceSHA,
 				BlockingStatus: normalizePipelineStatus(status),
 				WebURL:         &webURL, FailedJobs: failedJobs,
 			}
+			if p.Kind == stack.PipelineMergedResult {
+				targetSHA := member.TargetSHA
+				apiPipeline.TargetSHA = &targetSHA
+			}
+			apiMember.Pipeline = apiPipeline
 		} else {
 			currentness, applicability := "not_applicable", "not_applicable"
 			switch policy {
@@ -415,6 +482,15 @@ func buildAPIStack(observedAt string, rc repositoryContext, selector api.Selecto
 				currentness, applicability = "missing", "required"
 			case stack.CIPolicyUnknown:
 				currentness, applicability = "missing", "unknown"
+			}
+			for _, p := range pipelines {
+				if p.MRIID == member.IID && p.SourceSHA == member.SourceSHA {
+					currentness = "ambiguous"
+					if policy == stack.CIPolicyOptional {
+						applicability = "unknown"
+					}
+					break
+				}
 			}
 			apiMember.Pipeline = &api.Pipeline{
 				Applicability: applicability, Currentness: currentness,

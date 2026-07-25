@@ -61,11 +61,12 @@ func (h *Handler) restackPlan(ctx context.Context, inv cli.Invocation) (cli.Resu
 	}
 	inputs, err := layerInputs(current, first, overrides)
 	if err != nil {
-		return cli.Result{}, cli.Invalid("invalid_selector", err.Error())
+		return h.preflightBlockerResult(inv.Name, current,
+			fmt.Errorf("%w: %v", restack.ErrAmbiguousBoundary, err))
 	}
 	plan, err := (restack.Planner{Repo: rc.repo}).Build(ctx, replayBase(current, first), inputs, inv.AllowSignatureLoss)
 	if err != nil {
-		return cli.Result{}, restackPreflightError(err)
+		return h.preflightBlockerResult(inv.Name, current, err)
 	}
 	apiPlan := api.Plan{
 		SnapshotID: current.SnapshotID, State: "ready", CreatedAt: h.now(),
@@ -147,21 +148,20 @@ func (h *Handler) restackStart(ctx context.Context, inv cli.Invocation) (cli.Res
 		if member.Author.ID == user.ID.String() && member.Author.Username == user.Username {
 			continue
 		}
-		env, factory, envelopeErr := h.envelope(inv.Name)
-		if envelopeErr != nil {
-			return cli.Result{}, cli.Internal("cannot create response envelope", envelopeErr)
-		}
-		env.Stack = &current
 		scope := api.FindingScope{Kind: "member", MRIID: &member.IID, Position: &member.Position}
-		finding, findingErr := factory.NewFinding("foreign_authored_member",
-			api.DispositionHumanRequired, scope,
-			fmt.Sprintf("MR !%d is not authored by the current GitLab user", member.IID))
-		if findingErr != nil {
-			return cli.Result{}, cli.Internal("cannot create authorship finding", findingErr)
+		fields := map[string]any{
+			"member_iid": member.IID, "web_url": member.WebURL, "state": member.State,
+			"source_branch": member.SourceBranch, "target_branch": member.TargetBranch,
 		}
-		env.Findings = append(env.Findings, finding)
-		env.ApplyFindingDisposition()
-		return result(env, finding.Summary)
+		if member.SourceSHA != nil {
+			fields["source_sha"] = *member.SourceSHA
+		}
+		if member.TargetSHA != nil {
+			fields["target_sha"] = *member.TargetSHA
+		}
+		return h.humanHandoffResult(inv.Name, current, "foreign_authored_member", scope,
+			fmt.Sprintf("MR !%d is not authored by the current GitLab user", member.IID),
+			evidenceInput{kind: "gitlab_mr", fields: fields})
 	}
 	first := 0
 	if current.AffectedSuffix != nil {
@@ -193,22 +193,37 @@ func (h *Handler) restackStart(ctx context.Context, inv cli.Invocation) (cli.Res
 			"cannot inspect affected local worktrees", false)
 	}
 	if len(localWork) != 0 {
-		return cli.Result{}, cli.Invalid("invalid_selector",
-			"local work is present on an affected branch; restack did not start")
+		evidence := make([]evidenceInput, 0, len(localWork))
+		for _, work := range localWork {
+			fields := map[string]any{
+				"branch": work.Branch, "git_state": work.Kind,
+			}
+			if work.Path != "" {
+				fields["path"] = work.Path
+			}
+			evidence = append(evidence, evidenceInput{kind: "local_worktree", fields: fields})
+		}
+		return h.humanHandoffResult(inv.Name, current, "local_work_present",
+			api.FindingScope{Kind: "repository"},
+			"local work is present on an affected branch; restack did not start", evidence...)
 	}
 	inputs, err := layerInputs(current, first, overrides)
 	if err != nil {
-		return cli.Result{}, cli.Invalid("invalid_selector", err.Error())
+		return h.preflightBlockerResult(inv.Name, current,
+			fmt.Errorf("%w: %v", restack.ErrAmbiguousBoundary, err))
 	}
 	plan, err := (restack.Planner{Repo: rc.repo}).Build(ctx, replayBase(current, first), inputs, inv.AllowSignatureLoss)
 	if err != nil {
-		return cli.Result{}, restackPreflightError(err)
+		return h.preflightBlockerResult(inv.Name, current, err)
 	}
 	branches := sortedRefNames(capturedRefs)
 	actual, err := rc.repo.RemoteRefs(ctx, rc.remoteName, branches)
-	if err != nil || journal.ReconcileRefs(capturedRefs, capturedRefs, actual) != journal.RefsAllOld {
-		return cli.Result{}, cli.Invalid("invalid_selector",
-			"an affected remote ref changed after the snapshot; restack did not start")
+	if err != nil {
+		return cli.Result{}, cli.Unavailable("git_transport_failed",
+			"cannot re-read affected remote refs before restack", true)
+	}
+	if journal.ReconcileRefs(capturedRefs, capturedRefs, actual) != journal.RefsAllOld {
+		return h.remoteChangedResult(inv.Name, current, rc.repo.Dir, capturedRefs, actual)
 	}
 	j, err := h.openJournal(rc.repo.Dir)
 	if err != nil {
@@ -271,8 +286,7 @@ func (h *Handler) restackStart(ctx context.Context, inv cli.Invocation) (cli.Res
 		if _, err := h.persistReplayStop(ctx, rc, j, stored, &durable, stopped); err != nil {
 			return cli.Result{}, cli.Unavailable("journal_unavailable", "cannot persist replay stop", false)
 		}
-		return h.sessionResult(inv.Name, durable.API, api.DispositionHumanRequired,
-			fmt.Sprintf("Restack session %s paused in %s", sessionID, stopped.Stop))
+		return h.replayStopResult(inv.Name, durable.API)
 	}
 	return h.prepareAndPublish(ctx, inv, rc, j, stored, &durable, newHeads)
 }
@@ -375,19 +389,6 @@ func layerInputs(s api.Stack, first int, overrides map[int]string) ([]restack.La
 		})
 	}
 	return inputs, nil
-}
-
-func restackPreflightError(err error) error {
-	switch {
-	case errors.Is(err, restack.ErrSignedCommit):
-		return cli.Invalid("invalid_selector",
-			"signed commits require explicit --allow-signature-loss")
-	case errors.Is(err, restack.ErrAmbiguousBoundary), errors.Is(err, restack.ErrEmptyLayer),
-		errors.Is(err, restack.ErrMergeCommit):
-		return cli.Invalid("invalid_selector", err.Error())
-	default:
-		return cli.Unavailable("git_transport_failed", "restack preflight could not inspect layer commits", false)
-	}
 }
 
 func (h *Handler) persistReplayStop(ctx context.Context, rc repositoryContext, j *journal.Journal,
@@ -918,8 +919,7 @@ func (h *Handler) resumeReplay(ctx context.Context, inv cli.Invocation, rc repos
 				return cli.Result{}, cli.Unavailable("journal_unavailable",
 					"cannot persist repeated replay stop", false)
 			}
-			return h.sessionResult(inv.Name, durable.API, api.DispositionHumanRequired,
-				fmt.Sprintf("Restack session %s paused again in %s", stored.ID, stopped.Stop))
+			return h.replayStopResult(inv.Name, durable.API)
 		}
 		_, _ = h.transitionSession(ctx, j, stored.ID, replaying.Revision, durable, "invalidated")
 		return cli.Result{}, cli.Unavailable("git_transport_failed",

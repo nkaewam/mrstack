@@ -62,9 +62,13 @@ func (r *Repository) AffectedLocalWork(ctx context.Context, remote string, captu
 		return nil, err
 	}
 	var found []LocalWork
+	worktreePath := make(map[string]string, len(worktrees))
 	for _, worktree := range worktrees {
-		expected, affected := captured[worktree.Branch]
-		if !affected || worktree.Bare {
+		if worktree.Bare || worktree.Branch == "" {
+			continue
+		}
+		worktreePath[worktree.Branch] = worktree.Path
+		if _, affected := captured[worktree.Branch]; !affected {
 			continue
 		}
 		dirty, err := r.Dirty(ctx, worktree.Path)
@@ -74,17 +78,28 @@ func (r *Repository) AffectedLocalWork(ctx context.Context, remote string, captu
 		if dirty {
 			found = append(found, LocalWork{Branch: worktree.Branch, Path: worktree.Path, Kind: "dirty_worktree"})
 		}
-		local, err := r.RevParse(ctx, "refs/heads/"+worktree.Branch)
+	}
+
+	branches := make([]string, 0, len(captured))
+	for branch := range captured {
+		branches = append(branches, branch)
+	}
+	sort.Strings(branches)
+	for _, branch := range branches {
+		expected := captured[branch]
+		local, err := r.RevParse(ctx, "refs/heads/"+branch)
 		if err != nil {
 			continue
 		}
 		if local != expected {
 			represented, err := r.IsAncestor(ctx, local, expected)
 			if err != nil {
-				return nil, fmt.Errorf("inspect local branch %s: %w", worktree.Branch, err)
+				return nil, fmt.Errorf("inspect local branch %s: %w", branch, err)
 			}
 			if !represented {
-				found = append(found, LocalWork{Branch: worktree.Branch, Path: worktree.Path, Kind: "local_only_commits"})
+				found = append(found, LocalWork{
+					Branch: branch, Path: worktreePath[branch], Kind: "local_only_commits",
+				})
 			}
 		}
 	}

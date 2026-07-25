@@ -183,6 +183,20 @@ type Pipeline struct {
 	Source string      `json:"source"`
 }
 
+// PipelineMergeRequest is the deliberately small association shape returned
+// by GitLab's pipeline-to-merge-request endpoint. The complete MR payload is
+// not needed to prove the association.
+type PipelineMergeRequest struct {
+	IID int `json:"iid"`
+}
+
+// Commit contains only immutable commit evidence needed to validate a merged
+// results pipeline. ParentIDs must be checked exactly by the caller.
+type Commit struct {
+	ID        string   `json:"id"`
+	ParentIDs []string `json:"parent_ids"`
+}
+
 type Job struct {
 	ID        json.Number `json:"id"`
 	Name      string      `json:"name"`
@@ -191,12 +205,74 @@ type Job struct {
 	AllowFail bool        `json:"allow_failure"`
 }
 
+func validDecimalID(id string) bool {
+	if id == "" {
+		return false
+	}
+	_, err := strconv.ParseUint(id, 10, 64)
+	return err == nil
+}
+
+func fullObjectID(id string) bool {
+	if len(id) != 40 && len(id) != 64 {
+		return false
+	}
+	for _, c := range id {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// Pipeline reads the full pipeline resource. Embedded head_pipeline objects
+// can omit fields such as source and ref, so they are not sufficient evidence
+// for classifying merge-request pipeline kinds.
+func (c Client) Pipeline(ctx context.Context, projectID, pipelineID string) (Pipeline, error) {
+	prefix, err := projectPrefix(projectID)
+	if err != nil {
+		return Pipeline{}, err
+	}
+	if !validDecimalID(pipelineID) {
+		return Pipeline{}, errors.New("pipeline ID must be decimal")
+	}
+	var pipeline Pipeline
+	err = c.api(ctx, prefix+"/pipelines/"+pipelineID, &pipeline)
+	return pipeline, err
+}
+
+func (c Client) PipelineMergeRequests(ctx context.Context, projectID, pipelineID string) ([]PipelineMergeRequest, error) {
+	prefix, err := projectPrefix(projectID)
+	if err != nil {
+		return nil, err
+	}
+	if !validDecimalID(pipelineID) {
+		return nil, errors.New("pipeline ID must be decimal")
+	}
+	var requests []PipelineMergeRequest
+	err = c.api(ctx, prefix+"/pipelines/"+pipelineID+"/merge_requests", &requests)
+	return requests, err
+}
+
+func (c Client) Commit(ctx context.Context, projectID, oid string) (Commit, error) {
+	prefix, err := projectPrefix(projectID)
+	if err != nil {
+		return Commit{}, err
+	}
+	if !fullObjectID(oid) {
+		return Commit{}, errors.New("commit ID must be a full object ID")
+	}
+	var commit Commit
+	err = c.api(ctx, prefix+"/repository/commits/"+strings.ToLower(oid), &commit)
+	return commit, err
+}
+
 func (c Client) PipelineJobs(ctx context.Context, projectID, pipelineID string) ([]Job, error) {
 	prefix, err := projectPrefix(projectID)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := strconv.ParseUint(pipelineID, 10, 64); err != nil {
+	if !validDecimalID(pipelineID) {
 		return nil, errors.New("pipeline ID must be decimal")
 	}
 	var jobs []Job

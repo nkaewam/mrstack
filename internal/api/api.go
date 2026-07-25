@@ -90,6 +90,20 @@ func (f *Factory) NewEvidence(kind string, fields map[string]any) (Evidence, err
 	return ev, nil
 }
 
+// NewRemediation assigns a stable opaque identity and validates the complete
+// packet before it can be attached to an envelope.
+func (f *Factory) NewRemediation(remediation Remediation) (Remediation, error) {
+	id, err := f.ids.NewID("rem")
+	if err != nil {
+		return Remediation{}, fmt.Errorf("api: create remediation ID: %w", err)
+	}
+	remediation.RemediationID = id
+	if err := validateRemediation(remediation); err != nil {
+		return Remediation{}, err
+	}
+	return remediation, nil
+}
+
 func timestamp(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }

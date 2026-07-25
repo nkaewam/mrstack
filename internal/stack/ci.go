@@ -16,16 +16,19 @@ const (
 	PipelineBranch       PipelineKind = "branch"
 	PipelineDetachedMR   PipelineKind = "detached_merge_request"
 	PipelineMergedResult PipelineKind = "merged_result"
+	PipelineUnknown      PipelineKind = "unknown"
 )
 
 type Pipeline struct {
 	ID               int64
 	MRIID            int
 	Kind             PipelineKind
+	SHA              string
 	SourceSHA        string
 	AssociatedWithMR bool
 	SyntheticParents []string
 	Status           string
+	WebURL           string
 	FailedJobIDs     []int64
 }
 
@@ -48,6 +51,10 @@ func AssessCI(member MergeRequest, policy CIPolicy, pipelines []Pipeline) CIAsse
 		}
 		switch pipeline.Kind {
 		case PipelineBranch, PipelineDetachedMR:
+			if !pipeline.AssociatedWithMR {
+				ambiguous = true
+				continue
+			}
 			exact = append(exact, pipeline)
 		case PipelineMergedResult:
 			if !pipeline.AssociatedWithMR || !sameTwoParents(pipeline.SyntheticParents, member.SourceSHA, member.TargetSHA) {

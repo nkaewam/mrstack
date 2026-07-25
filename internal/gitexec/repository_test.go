@@ -2,6 +2,7 @@ package gitexec
 
 import (
 	"context"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,8 +22,11 @@ func TestParseRemoteIdentity(t *testing.T) {
 		{"ssh url", "ssh://git@gitlab.example.com/team/service.git", RemoteIdentity{"gitlab.example.com", "team/service"}, true},
 		{"scp", "git@gitlab.example.com:team/service.git", RemoteIdentity{"gitlab.example.com", "team/service"}, true},
 		{"nested", "git@GITLAB.EXAMPLE.COM:group/sub/service", RemoteIdentity{"gitlab.example.com", "group/sub/service"}, true},
+		{"credential word is valid path data", "https://gitlab.example.com/team/token-service.git", RemoteIdentity{"gitlab.example.com", "team/token-service"}, true},
 		{"userinfo only", "user@example.com", RemoteIdentity{}, false},
 		{"path traversal", "git@example.com:team/../secret.git", RemoteIdentity{}, false},
+		{"userinfo marker in project", "ssh://git@example.com/team/@secret.git", RemoteIdentity{}, false},
+		{"whitespace in SCP host", "git@ example.com:team/service.git", RemoteIdentity{}, false},
 		{"empty", "", RemoteIdentity{}, false},
 	}
 	for _, tt := range tests {
@@ -39,15 +43,36 @@ func TestParseRemoteIdentity(t *testing.T) {
 
 func FuzzParseRemoteIdentityNeverLeaksCredentials(f *testing.F) {
 	f.Add("https://alice:token@gitlab.example.com/team/service.git")
+	f.Add("https://gitlab.example.com/team/token-service.git")
 	f.Add("git@gitlab.example.com:team/service.git")
 	f.Fuzz(func(t *testing.T, raw string) {
 		got, err := ParseRemoteIdentity(raw)
 		if err != nil {
 			return
 		}
-		if strings.Contains(got.Host, "@") || strings.Contains(got.Project, "@") ||
-			strings.Contains(got.Host, "token") || strings.Contains(got.Project, "token") {
+		if strings.Contains(got.Host, "@") || strings.Contains(got.Project, "@") {
 			t.Fatalf("credential-shaped output: %#v", got)
+		}
+		if strings.Contains(raw, "://") {
+			parsed, parseErr := url.Parse(strings.TrimSpace(raw))
+			if parseErr != nil || parsed.User == nil {
+				return
+			}
+			parsed.User = nil
+			withoutCredentials, cleanErr := ParseRemoteIdentity(parsed.String())
+			if cleanErr != nil || !reflect.DeepEqual(got, withoutCredentials) {
+				t.Fatalf("userinfo affected remote identity: raw=%q got=%#v clean=%#v err=%v",
+					raw, got, withoutCredentials, cleanErr)
+			}
+			return
+		}
+		trimmed := strings.TrimSpace(raw)
+		if at := strings.LastIndex(trimmed, "@"); at >= 0 {
+			withoutCredentials, cleanErr := ParseRemoteIdentity(trimmed[at+1:])
+			if cleanErr != nil || !reflect.DeepEqual(got, withoutCredentials) {
+				t.Fatalf("SCP userinfo affected remote identity: raw=%q got=%#v clean=%#v err=%v",
+					raw, got, withoutCredentials, cleanErr)
+			}
 		}
 	})
 }
@@ -174,6 +199,18 @@ func TestRealRepositoryAncestryDirtyAndLocalOnlyWork(t *testing.T) {
 	}
 	if len(work) != 1 || work[0].Kind != "dirty_worktree" {
 		t.Fatalf("expected dirty worktree, got %#v", work)
+	}
+
+	runGit(t, clone, "branch", "unchecked-local-only", feature)
+	work, err = repo.AffectedLocalWork(ctx, "origin", map[string]string{
+		"unchecked-local-only": initial,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(work) != 1 || work[0].Branch != "unchecked-local-only" ||
+		work[0].Kind != "local_only_commits" || work[0].Path != "" {
+		t.Fatalf("expected unchecked local-only branch work, got %#v", work)
 	}
 
 	runGit(t, clone, "branch", "safe-local", initial)

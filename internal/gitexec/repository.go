@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 var ErrNotRepository = errors.New("not a git repository")
@@ -111,10 +112,17 @@ func ParseRemoteIdentity(raw string) (RemoteIdentity, error) {
 		host = strings.ToLower(host)
 	}
 	project := strings.Trim(strings.TrimSuffix(path, ".git"), "/")
-	if host == "" || project == "" || strings.Contains(project, "..") {
+	if host == "" || project == "" || strings.Contains(project, "..") ||
+		unsafeRemoteComponent(host) || unsafeRemoteComponent(project) {
 		return RemoteIdentity{}, fmt.Errorf("unsafe remote identity")
 	}
 	return RemoteIdentity{Host: host, Project: project}, nil
+}
+
+func unsafeRemoteComponent(value string) bool {
+	return strings.ContainsRune(value, '@') || strings.IndexFunc(value, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.IsSpace(r)
+	}) >= 0
 }
 
 func (r *Repository) RemoteIdentity(ctx context.Context, name string, push bool) (RemoteIdentity, error) {

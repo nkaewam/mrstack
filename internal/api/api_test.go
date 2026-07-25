@@ -277,6 +277,49 @@ func TestEnvelopeRejectsDanglingAndDuplicateReferences(t *testing.T) {
 	}
 }
 
+func TestRemediationBuilderValidatesDiscriminatedPackets(t *testing.T) {
+	t.Parallel()
+	factory, _ := NewFactory(ClockFunc(time.Now), &sequenceIDs{})
+	sessionID := "ses_1"
+	commit := strings.Repeat("a", 40)
+	valid := Remediation{
+		FindingID: "fnd_1", Kind: "choose_empty_commit", SessionID: &sessionID,
+		Layer: &RemediationLayer{MRIID: 7, CommitSHA: &commit},
+		RequiredWork: &RequiredWork{
+			Kind: "choose_empty_commit_outcome", Options: []string{"drop_current", "keep_empty"},
+		},
+		EvidenceRefs: []string{},
+		Actions: []Action{
+			validSessionAction("continue_drop_current", sessionID, "empty_commit_current"),
+			validSessionAction("continue_keep_empty", sessionID, "empty_commit_current"),
+		},
+	}
+	if _, err := factory.NewRemediation(valid); err != nil {
+		t.Fatalf("valid remediation rejected: %v", err)
+	}
+	invalid := valid
+	invalid.RequiredWork = &RequiredWork{
+		Kind: "choose_empty_commit_outcome", Options: []string{"drop_current", "drop_current"},
+	}
+	if _, err := factory.NewRemediation(invalid); err == nil {
+		t.Fatal("schema-invalid empty-commit choices accepted")
+	}
+	invalid = valid
+	invalid.Actions = invalid.Actions[:1]
+	if _, err := factory.NewRemediation(invalid); err == nil {
+		t.Fatal("empty-commit packet with one transition accepted")
+	}
+}
+
+func validSessionAction(kind, sessionID, extraPrecondition string) Action {
+	return Action{
+		Kind: kind, Argv: []string{"mrstack", "restack", "continue", "--session", sessionID},
+		CWD: "/repo", Mutates: true, ConfirmationRequired: true,
+		Preconditions: []string{"session_state_current", extraPrecondition},
+		Requires:      ActionRequirements{SessionID: &sessionID, JobIDs: []string{}},
+	}
+}
+
 func TestRedactionGuardCoversNestedAdditiveData(t *testing.T) {
 	for _, data := range []map[string]any{
 		{"nested": map[string]any{"authorization": "Bearer abc"}},
@@ -345,7 +388,7 @@ func TestOperationalOutcomeInvariants(t *testing.T) {
 
 func TestCommandSpecificData(t *testing.T) {
 	for command, data := range map[CommandName]map[string]any{
-		CommandDoctor:       {"doctor": DoctorData{}},
+		CommandDoctor:       {"doctor": validDoctorDataFixture()},
 		CommandRestackPlan:  {"plan": nil},
 		CommandCILogs:       {"log_request": LogRequest{PipelineID: "1", JobIDs: []string{"2"}}, "log_budget": LogBudget{RequestedBytes: 1, EffectiveBytes: 1, HardMaxBytes: 4194304, Allocation: "equal_per_job_tail"}, "logs": []LogEntry{{PipelineID: "1", JobID: "2"}}},
 		CommandHistoryShow:  {"history": HistoryData{}},
@@ -362,6 +405,81 @@ func TestCommandSpecificData(t *testing.T) {
 		if err := Validate(envelope); err != nil {
 			t.Errorf("%s rejected with required keys: %v", command, err)
 		}
+	}
+}
+
+func TestDoctorDataValidatesNestedCapabilityContract(t *testing.T) {
+	valid := validDoctorDataFixture()
+	validate := func(t *testing.T, data DoctorData) error {
+		t.Helper()
+		envelope := newEnvelope(t, CommandDoctor)
+		envelope.Data["doctor"] = data
+		return Validate(envelope)
+	}
+	if err := validate(t, valid); err != nil {
+		t.Fatalf("valid doctor data rejected: %v", err)
+	}
+
+	tests := map[string]func(*DoctorData){
+		"unknown capability": func(data *DoctorData) {
+			data.Capabilities[0].Name = "stack_discovery"
+		},
+		"unknown status": func(data *DoctorData) {
+			data.Capabilities[0].Status = "available"
+		},
+		"empty summary": func(data *DoctorData) {
+			data.Capabilities[0].Summary = " "
+		},
+		"duplicate capability": func(data *DoctorData) {
+			data.Capabilities[1].Name = data.Capabilities[0].Name
+		},
+		"missing capability": func(data *DoctorData) {
+			data.Capabilities = data.Capabilities[:len(data.Capabilities)-1]
+		},
+		"unknown requested mode": func(data *DoctorData) {
+			data.RequestedMode = "future"
+		},
+		"unknown effective mode": func(data *DoctorData) {
+			data.EffectiveMode = "future"
+		},
+		"detected mode disagrees": func(data *DoctorData) {
+			native := "native"
+			data.DetectedMode = &native
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			data := valid
+			data.Capabilities = append([]Capability(nil), valid.Capabilities...)
+			mutate(&data)
+			if err := validate(t, data); err == nil {
+				t.Fatal("schema-invalid nested doctor data was accepted")
+			}
+		})
+	}
+}
+
+func stringPointer(value string) *string { return &value }
+
+func validDoctorDataFixture() DoctorData {
+	mode := "legacy"
+	return DoctorData{
+		RequestedMode: "auto",
+		DetectedMode:  &mode,
+		EffectiveMode: mode,
+		ServerVersion: stringPointer("18.11.3-ee"),
+		GitVersion:    "git version 2.50.1",
+		GlabVersion:   "glab 1.70.0",
+		Capabilities: []Capability{
+			{Name: "repository_context", Status: "verified", Summary: "Repository context resolved."},
+			{Name: "git", Status: "verified", Summary: "Git is available."},
+			{Name: "glab", Status: "verified", Summary: "glab is available."},
+			{Name: "gitlab_auth", Status: "verified", Summary: "Authentication succeeded."},
+			{Name: "server_mode", Status: "verified", Summary: "Server mode was detected."},
+			{Name: "atomic_push", Status: "unverified", Summary: "Checked during publication."},
+			{Name: "target_update", Status: "unverified", Summary: "Checked during target update."},
+			{Name: "sqlite_journal", Status: "verified", Summary: "The journal is available."},
+		},
 	}
 }
 

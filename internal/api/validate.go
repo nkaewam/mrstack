@@ -305,19 +305,106 @@ func validateRemediation(r Remediation) error {
 	if r.RemediationID == "" || r.FindingID == "" || r.EvidenceRefs == nil || r.Actions == nil {
 		return errors.New("api: remediation requires IDs and non-nil evidence_refs/actions")
 	}
-	known := map[string]bool{
-		"restack": true, "resolve_conflict": true, "choose_empty_commit": true,
-		"authorize_signature_loss": true, "inspect_ci_failure": true,
-		"recover_publication": true, "retry_retarget": true, "wait_and_recheck": true,
-		"refresh_local_checkout": true, "human_handoff": true,
-	}
-	if !known[r.Kind] {
-		return fmt.Errorf("api: unknown remediation kind %q", r.Kind)
+	if r.RequiredWork != nil {
+		if err := validateRequiredWork(*r.RequiredWork); err != nil {
+			return err
+		}
 	}
 	for _, action := range r.Actions {
 		if err := validateAction(action); err != nil {
 			return err
 		}
+	}
+	switch r.Kind {
+	case "restack":
+		if r.SnapshotID == nil || r.Layer == nil || r.Layer.BoundarySHA == nil ||
+			len(r.Actions) == 0 {
+			return errors.New("api: restack remediation requires snapshot, exact layer, and action")
+		}
+	case "resolve_conflict":
+		if r.SessionID == nil || r.Worktree == nil || r.RequiredWork == nil ||
+			r.RequiredWork.Kind != "resolve_and_stage_conflicts" || len(r.Actions) == 0 {
+			return errors.New("api: resolve_conflict remediation lacks bound conflict work")
+		}
+	case "choose_empty_commit":
+		if r.SessionID == nil || r.Layer == nil || r.Layer.CommitSHA == nil ||
+			r.RequiredWork == nil || r.RequiredWork.Kind != "choose_empty_commit_outcome" ||
+			len(r.Actions) < 2 {
+			return errors.New("api: choose_empty_commit remediation lacks bound commit choices")
+		}
+	case "authorize_signature_loss":
+		if r.SnapshotID == nil || len(r.Actions) != 0 {
+			return errors.New("api: signature-loss remediation requires snapshot and no executable action")
+		}
+	case "inspect_ci_failure":
+		if r.RequiredWork == nil || r.RequiredWork.Kind != "repair_ci_failure" || len(r.Actions) == 0 {
+			return errors.New("api: CI remediation lacks pinned repair work")
+		}
+	case "recover_publication", "retry_retarget":
+		if r.SessionID == nil || len(r.Actions) == 0 {
+			return fmt.Errorf("api: %s remediation requires session and action", r.Kind)
+		}
+	case "wait_and_recheck":
+		if len(r.Actions) == 0 {
+			return errors.New("api: wait remediation requires recheck action")
+		}
+	case "refresh_local_checkout":
+		if r.RequiredWork == nil || r.RequiredWork.Kind != "refresh_local_checkout" ||
+			len(r.Actions) != 0 {
+			return errors.New("api: local-checkout remediation lacks refresh work")
+		}
+	case "human_handoff":
+		if len(r.Actions) != 0 {
+			return errors.New("api: human handoff cannot contain executable actions")
+		}
+	default:
+		return fmt.Errorf("api: unknown remediation kind %q", r.Kind)
+	}
+	return nil
+}
+
+func validateRequiredWork(work RequiredWork) error {
+	nonempty := func(values []string) bool {
+		if len(values) == 0 {
+			return false
+		}
+		for _, value := range values {
+			if strings.TrimSpace(value) == "" {
+				return false
+			}
+		}
+		return true
+	}
+	switch work.Kind {
+	case "resolve_and_stage_conflicts":
+		if !nonempty(work.Paths) || work.Staging != "caller_explicit" {
+			return errors.New("api: conflict work requires paths and caller_explicit staging")
+		}
+	case "repair_ci_failure":
+		if !validDecimal(work.PipelineID) || !nonempty(work.JobIDs) {
+			return errors.New("api: CI repair work requires decimal pipeline and job IDs")
+		}
+		for _, id := range work.JobIDs {
+			if !validDecimal(id) {
+				return errors.New("api: CI repair work contains a non-decimal job ID")
+			}
+		}
+	case "choose_empty_commit_outcome":
+		if len(work.Options) != 2 ||
+			!((work.Options[0] == "drop_current" && work.Options[1] == "keep_empty") ||
+				(work.Options[1] == "drop_current" && work.Options[0] == "keep_empty")) {
+			return errors.New("api: empty-commit work requires the two stable outcomes")
+		}
+	case "obtain_human_decision", "wait_for_external_state":
+		if strings.TrimSpace(work.ReasonCode) == "" {
+			return fmt.Errorf("api: %s work requires reason_code", work.Kind)
+		}
+	case "refresh_local_checkout":
+		if strings.TrimSpace(work.Branch) == "" || !shaPattern.MatchString(work.ExpectedSHA) {
+			return errors.New("api: checkout refresh work requires branch and full expected SHA")
+		}
+	default:
+		return fmt.Errorf("api: unknown required_work kind %q", work.Kind)
 	}
 	return nil
 }
@@ -480,7 +567,10 @@ func validateCommandData(e Envelope) error {
 	}
 	switch e.Command.Name {
 	case CommandDoctor:
-		return typeOK("doctor", DoctorData{})
+		if err := typeOK("doctor", DoctorData{}); err != nil {
+			return err
+		}
+		return validateDoctorData(e.Data["doctor"].(DoctorData))
 	case CommandRestackPlan:
 		value, ok := e.Data["plan"]
 		if !ok {
@@ -530,6 +620,54 @@ func validateCommandData(e Envelope) error {
 			}
 			seen[log.JobID] = true
 		}
+	}
+	return nil
+}
+
+func validateDoctorData(data DoctorData) error {
+	if !oneOf(data.RequestedMode, "auto", "legacy", "native") ||
+		!oneOf(data.EffectiveMode, "legacy", "native") ||
+		strings.TrimSpace(data.GitVersion) == "" ||
+		strings.TrimSpace(data.GlabVersion) == "" {
+		return errors.New("api: invalid doctor mode or tool version")
+	}
+	if data.DetectedMode == nil {
+		if data.RequestedMode == "auto" || data.ServerVersion != nil ||
+			data.EffectiveMode != data.RequestedMode {
+			return errors.New("api: undetected doctor mode requires a matching explicit override and null server version")
+		}
+	} else {
+		if !oneOf(*data.DetectedMode, "legacy", "native") ||
+			*data.DetectedMode != data.EffectiveMode ||
+			data.ServerVersion == nil || strings.TrimSpace(*data.ServerVersion) == "" ||
+			(data.RequestedMode != "auto" && data.RequestedMode != *data.DetectedMode) {
+			return errors.New("api: detected doctor mode and server version are inconsistent")
+		}
+	}
+
+	required := map[string]bool{
+		"repository_context": false,
+		"git":                false,
+		"glab":               false,
+		"gitlab_auth":        false,
+		"server_mode":        false,
+		"atomic_push":        false,
+		"target_update":      false,
+		"sqlite_journal":     false,
+	}
+	if len(data.Capabilities) != len(required) {
+		return errors.New("api: doctor requires exactly one result for every capability")
+	}
+	for _, capability := range data.Capabilities {
+		seen, known := required[capability.Name]
+		if !known || seen {
+			return fmt.Errorf("api: unknown or duplicate doctor capability %q", capability.Name)
+		}
+		if !oneOf(capability.Status, "verified", "unverified", "unsupported") ||
+			strings.TrimSpace(capability.Summary) == "" {
+			return fmt.Errorf("api: invalid doctor capability %q", capability.Name)
+		}
+		required[capability.Name] = true
 	}
 	return nil
 }

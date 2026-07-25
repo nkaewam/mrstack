@@ -306,6 +306,8 @@ func TestRestackConflictContinueRequiresResolvedAndExplicitlyStagedWork(t *testi
 		t.Fatalf("expected conflict pause: exit=%d output=%s", start.exit, start.stdout)
 	}
 	assertPublishedSchema(t, start.stdout)
+	assertActionPacket(t, start.stdout, "rebase_conflict", "resolve_conflict",
+		"continue_restack")
 
 	refused := runMachine(t, handler, "--yes", "restack", "continue", "--session", session.ID)
 	if refused.exit != 2 {
@@ -339,6 +341,8 @@ func TestRestackEmptyCommitRequiresExplicitDropOrKeep(t *testing.T) {
 				t.Fatalf("expected empty pause: exit=%d output=%s", start.exit, start.stdout)
 			}
 			assertPublishedSchema(t, start.stdout)
+			assertActionPacket(t, start.stdout, "empty_commit", "choose_empty_commit",
+				"continue_drop_current", "continue_keep_empty")
 			refused := runMachine(t, handler, "--yes", "restack", "continue", "--session", session.ID)
 			if refused.exit != 2 {
 				t.Fatalf("plain empty continuation exit=%d output=%s", refused.exit, refused.stdout)
@@ -351,6 +355,31 @@ func TestRestackEmptyCommitRequiresExplicitDropOrKeep(t *testing.T) {
 			}
 			assertPublishedSchema(t, completed.stdout)
 		})
+	}
+}
+
+func TestRestackBlocksUncheckedOutLocalAheadBranchAuthoritatively(t *testing.T) {
+	handler, snapshotID := pausedSessionFixture(t, "conflict")
+	repo := handler.Dir
+	runGit(t, repo, "checkout", "main")
+	old := runGit(t, repo, "rev-parse", "refs/heads/feature")
+	tree := runGit(t, repo, "rev-parse", "refs/heads/feature^{tree}")
+	local := runGit(t, repo, "commit-tree", tree, "-p", old, "-m", "local only")
+	runGit(t, repo, "update-ref", "refs/heads/feature", local, old)
+
+	start := runMachine(t, handler, "--yes", "restack", "--snapshot", snapshotID)
+	if start.exit != 0 {
+		t.Fatalf("local-work blocker must be authoritative: exit=%d output=%s stderr=%s",
+			start.exit, start.stdout, start.stderr)
+	}
+	assertPublishedSchema(t, start.stdout)
+	assertActionPacket(t, start.stdout, "local_work_present", "human_handoff")
+	var envelope api.Envelope
+	if err := json.Unmarshal([]byte(start.stdout), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Disposition == nil || *envelope.Disposition != api.DispositionHumanRequired {
+		t.Fatalf("unexpected local-work disposition: %s", start.stdout)
 	}
 }
 
@@ -568,6 +597,91 @@ func TestHistoryShowAliasAndPruneThroughMachineInterface(t *testing.T) {
 	if remaining.exit != 0 || len(remainingEnvelope.Data.History.Observations) != 1 ||
 		remainingEnvelope.Data.History.Alias == nil {
 		t.Fatalf("prune did not preserve newest observation and identity: %s", remaining.stdout)
+	}
+}
+
+func TestCheckReconcilesTrackedFullyMergedStackOrFailsClosed(t *testing.T) {
+	for _, ambiguous := range []bool{false, true} {
+		t.Run(map[bool]string{false: "complete", true: "ambiguous"}[ambiguous], func(t *testing.T) {
+			repo, _, mainOID, firstOID, secondOID := createStackRepository(t)
+			responses := map[string]json.RawMessage{
+				"/version": json.RawMessage(`{"version":"18.11.2"}`),
+				"/projects/group%2Fproject": json.RawMessage(`{
+					"id":42,"path_with_namespace":"group/project",
+					"web_url":"https://gitlab.example/group/project","default_branch":"main",
+					"only_allow_merge_if_pipeline_succeeds":false
+				}`),
+			}
+			openMRs, _ := json.Marshal(stackMRPayload(mainOID, firstOID, secondOID, "opened", "", ""))
+			responses["/projects/42/merge_requests?state=all&scope=all&per_page=100"] = openMRs
+			handler := &Handler{
+				Runner: fakeGlabRunner{responses: responses}, Dir: repo,
+				StateDir: filepath.Join(t.TempDir(), "state"),
+				Now:      func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
+			}
+			observed := runMachine(t, handler, "check", "feature/two")
+			var captured api.Envelope
+			if observed.exit != 0 || json.Unmarshal([]byte(observed.stdout), &captured) != nil ||
+				captured.Stack == nil {
+				t.Fatalf("capture failed: %s", observed.stdout)
+			}
+			runGit(t, repo, "checkout", "main")
+			runGit(t, repo, "merge", "--no-ff", "-m", "merge one", "feature/one")
+			firstIntegration := runGit(t, repo, "rev-parse", "HEAD")
+			runGit(t, repo, "merge", "--no-ff", "-m", "merge two", "feature/two")
+			secondIntegration := runGit(t, repo, "rev-parse", "HEAD")
+			runGit(t, repo, "push", "origin", "main")
+			if ambiguous {
+				secondIntegration = ""
+			}
+			mergedMRs, _ := json.Marshal(stackMRPayload(
+				mainOID, firstOID, secondOID, "merged", firstIntegration, secondIntegration))
+			responses["/projects/42/merge_requests?state=all&scope=all&per_page=100"] = mergedMRs
+
+			reconciled := runMachine(t, handler, "check", "--stack", captured.Stack.StackID)
+			if reconciled.exit != 0 {
+				t.Fatalf("completion reconciliation must be authoritative: %s", reconciled.stdout)
+			}
+			assertPublishedSchema(t, reconciled.stdout)
+			var envelope api.Envelope
+			if err := json.Unmarshal([]byte(reconciled.stdout), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			want := api.DispositionComplete
+			if ambiguous {
+				want = api.DispositionHumanRequired
+				assertActionPacket(t, reconciled.stdout, "ambiguous_completion", "human_handoff")
+			}
+			if envelope.Disposition == nil || *envelope.Disposition != want {
+				t.Fatalf("completion disposition got %v want %s: %s",
+					envelope.Disposition, want, reconciled.stdout)
+			}
+		})
+	}
+}
+
+func stackMRPayload(base, first, second, state, firstIntegration, secondIntegration string) []map[string]any {
+	mergedAtOne, mergedAtTwo := "", ""
+	if state == "merged" {
+		mergedAtOne, mergedAtTwo = "2026-07-25T12:10:00Z", "2026-07-25T12:20:00Z"
+	}
+	return []map[string]any{
+		{
+			"iid": 1, "state": state, "source_branch": "feature/one", "target_branch": "main",
+			"sha": first, "web_url": "https://gitlab.example/group/project/-/merge_requests/1",
+			"author":                map[string]any{"id": 7, "username": "developer"},
+			"diff_refs":             map[string]any{"base_sha": base, "head_sha": first, "start_sha": base},
+			"detailed_merge_status": "mergeable", "merge_commit_sha": firstIntegration,
+			"merged_at": mergedAtOne,
+		},
+		{
+			"iid": 2, "state": state, "source_branch": "feature/two", "target_branch": "feature/one",
+			"sha": second, "web_url": "https://gitlab.example/group/project/-/merge_requests/2",
+			"author":                map[string]any{"id": 7, "username": "developer"},
+			"diff_refs":             map[string]any{"base_sha": first, "head_sha": second, "start_sha": first},
+			"detailed_merge_status": "mergeable", "merge_commit_sha": secondIntegration,
+			"merged_at": mergedAtTwo,
+		},
 	}
 }
 
@@ -877,6 +991,28 @@ func assertPublishedSchema(t *testing.T, document string) {
 	}
 	if err := schema.Validate(instance); err != nil {
 		t.Fatalf("schema-invalid output:\n%s\n%v", document, err)
+	}
+}
+
+func assertActionPacket(t *testing.T, document, findingCode, remediationKind string, actions ...string) {
+	t.Helper()
+	var envelope api.Envelope
+	if err := json.Unmarshal([]byte(document), &envelope); err != nil {
+		t.Fatalf("decode action packet: %v", err)
+	}
+	if len(envelope.Findings) != 1 || envelope.Findings[0].Code != findingCode ||
+		len(envelope.Evidence) == 0 || len(envelope.Remediations) != 1 ||
+		envelope.Remediations[0].Kind != remediationKind {
+		t.Fatalf("missing typed %s/%s packet: %s", findingCode, remediationKind, document)
+	}
+	got := map[string]bool{}
+	for _, action := range envelope.Remediations[0].Actions {
+		got[action.Kind] = true
+	}
+	for _, action := range actions {
+		if !got[action] {
+			t.Fatalf("typed packet lacks action %q: %s", action, document)
+		}
 	}
 }
 

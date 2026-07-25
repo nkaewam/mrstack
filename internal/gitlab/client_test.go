@@ -98,6 +98,54 @@ func TestIDsAreValidatedBeforeGlab(t *testing.T) {
 	if _, err := client.MergeRequests(context.Background(), "1", "future"); err == nil {
 		t.Fatal("unsafe merge request state accepted")
 	}
+	if _, err := client.Pipeline(context.Background(), "1", "bad"); err == nil {
+		t.Fatal("unsafe pipeline ID accepted")
+	}
+	if _, err := client.PipelineMergeRequests(context.Background(), "1", "-2"); err == nil {
+		t.Fatal("unsafe pipeline association ID accepted")
+	}
+	if _, err := client.Commit(context.Background(), "1", "not-an-object-id"); err == nil {
+		t.Fatal("unsafe commit ID accepted")
+	}
+}
+
+func TestPipelineEvidenceTransportUsesTypedEndpoints(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{stdout: []byte(`{"id":9,"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source":"merge_request_event"}`)}
+	client := Client{Runner: runner}
+	pipeline, err := client.Pipeline(context.Background(), "42", "9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pipeline.ID.String() != "9" || pipeline.Source != "merge_request_event" {
+		t.Fatalf("pipeline evidence lost: %#v", pipeline)
+	}
+	runner.stdout = []byte(`[{"iid":7}]`)
+	associated, err := client.PipelineMergeRequests(context.Background(), "42", "9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(associated) != 1 || associated[0].IID != 7 {
+		t.Fatalf("association evidence lost: %#v", associated)
+	}
+	runner.stdout = []byte(`{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","parent_ids":["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","cccccccccccccccccccccccccccccccccccccccc"]}`)
+	commit, err := client.Commit(context.Background(), "42", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commit.ParentIDs) != 2 {
+		t.Fatalf("parent evidence lost: %#v", commit)
+	}
+	wantEndpoints := []string{
+		"/projects/42/pipelines/9",
+		"/projects/42/pipelines/9/merge_requests",
+		"/projects/42/repository/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	for i, endpoint := range wantEndpoints {
+		if !reflect.DeepEqual(runner.calls[i], []string{"glab", "api", endpoint}) {
+			t.Fatalf("call %d=%#v want endpoint %q", i, runner.calls[i], endpoint)
+		}
+	}
 }
 
 func TestBoundLogsBudgetTailUTF8AndOrdering(t *testing.T) {
