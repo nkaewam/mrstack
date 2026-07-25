@@ -63,6 +63,9 @@ func (h *Handler) reconcileTrackedCompletion(ctx context.Context, inv cli.Invoca
 		return cli.Result{}, true, cli.Unavailable("journal_unavailable",
 			"cannot read tracked stack completion history", false)
 	}
+	if err := historyPageBelongsToProject(page, rc.fetch.Host, rc.fetch.Project); err != nil {
+		return cli.Result{}, true, err
+	}
 	var historical api.Envelope
 	if err := json.Unmarshal(page.Records[0].Payload, &historical); err != nil || historical.Stack == nil {
 		return cli.Result{}, true, cli.Internal("stored stack observation is invalid", err)

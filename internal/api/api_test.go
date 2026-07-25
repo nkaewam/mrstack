@@ -277,6 +277,70 @@ func TestEnvelopeRejectsDanglingAndDuplicateReferences(t *testing.T) {
 	}
 }
 
+func TestRemediationSemanticIdentitiesMustAgreeWithEnvelope(t *testing.T) {
+	t.Parallel()
+	snapshotID, sessionID, planID := "snp_1", "ses_1", "pln_1"
+	commit := strings.Repeat("a", 40)
+	env := Envelope{
+		Stack: &Stack{SnapshotID: snapshotID, Members: []Member{
+			{Position: 0, IID: 7, Layer: Layer{BoundarySHA: &commit}},
+		}},
+		Session: &Session{
+			SessionID: sessionID, PlanID: &planID,
+			Worktree:     &SessionWorktree{Path: "/managed", GitState: "rebase_conflict"},
+			CurrentLayer: &CurrentLayer{MRIID: 7, OriginalCommitSHA: commit},
+		},
+		Findings: []Finding{{FindingID: "fnd_1"}},
+		Evidence: []Evidence{},
+		Remediations: []Remediation{{
+			RemediationID: "rem_1", FindingID: "fnd_1", Kind: "human_handoff",
+			EvidenceRefs: []string{}, Actions: []Action{},
+		}},
+		Data: map[string]any{},
+	}
+	if err := validateReferences(env); err != nil {
+		t.Fatalf("valid semantic bindings rejected: %v", err)
+	}
+	tests := map[string]func(*Remediation){
+		"snapshot": func(r *Remediation) {
+			value := "snp_other"
+			r.SnapshotID = &value
+		},
+		"session": func(r *Remediation) {
+			value := "ses_other"
+			r.SessionID = &value
+		},
+		"plan": func(r *Remediation) {
+			value := "pln_other"
+			r.PlanID = &value
+		},
+		"member": func(r *Remediation) {
+			r.Member = &RemediationMember{IID: 8, Position: 0}
+		},
+		"layer": func(r *Remediation) {
+			other := strings.Repeat("b", 40)
+			r.Layer = &RemediationLayer{MRIID: 7, CommitSHA: &other}
+		},
+		"worktree": func(r *Remediation) {
+			r.Worktree = &SessionWorktree{Path: "/other", GitState: "rebase_conflict"}
+		},
+		"action plan": func(r *Remediation) {
+			value := "pln_other"
+			r.Actions = []Action{{Requires: ActionRequirements{PlanID: &value}}}
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			copyEnv := env
+			copyEnv.Remediations = append([]Remediation(nil), env.Remediations...)
+			mutate(&copyEnv.Remediations[0])
+			if err := validateReferences(copyEnv); err == nil {
+				t.Fatal("mismatched semantic binding accepted")
+			}
+		})
+	}
+}
+
 func TestRemediationBuilderValidatesDiscriminatedPackets(t *testing.T) {
 	t.Parallel()
 	factory, _ := NewFactory(ClockFunc(time.Now), &sequenceIDs{})

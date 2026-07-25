@@ -137,8 +137,8 @@ func (h *Handler) restackStart(ctx context.Context, inv cli.Invocation) (cli.Res
 		return cli.Result{}, err
 	}
 	if current.SnapshotID != snapshotID {
-		return cli.Result{}, cli.Invalid("invalid_selector",
-			"snapshot is stale; restack did not start")
+		return h.remoteChangedResult(inv.Name, captured.Stack, rc.repo.Dir,
+			stackRefMap(captured.Stack), stackRefMap(current), nil)
 	}
 	user, err := rc.client.CurrentUser(ctx)
 	if err != nil {
@@ -223,7 +223,7 @@ func (h *Handler) restackStart(ctx context.Context, inv cli.Invocation) (cli.Res
 			"cannot re-read affected remote refs before restack", true)
 	}
 	if journal.ReconcileRefs(capturedRefs, capturedRefs, actual) != journal.RefsAllOld {
-		return h.remoteChangedResult(inv.Name, current, rc.repo.Dir, capturedRefs, actual)
+		return h.remoteChangedResult(inv.Name, current, rc.repo.Dir, capturedRefs, actual, nil)
 	}
 	j, err := h.openJournal(rc.repo.Dir)
 	if err != nil {
@@ -259,7 +259,7 @@ func (h *Handler) restackStart(ctx context.Context, inv cli.Invocation) (cli.Res
 		OldRefs: capturedRefs, NewRefs: map[string]string{}, Payload: payload,
 	}); err != nil {
 		if errors.Is(err, journal.ErrOperationInProgress) {
-			return h.operationInProgress(ctx, inv.Name, current, j, projectKey)
+			return h.operationInProgress(ctx, inv.Name, current, rc.repo.Dir, j, projectKey)
 		}
 		return cli.Result{}, cli.Unavailable("journal_unavailable", "cannot begin restack session", false)
 	}
@@ -477,15 +477,26 @@ func (h *Handler) prepareAndPublish(ctx context.Context, inv cli.Invocation, rc 
 		return cli.Result{}, err
 	}
 	if revalidated.SnapshotID != stored.SnapshotID {
-		_, _ = h.transitionSession(ctx, j, stored.ID, stored.Revision, durable, "invalidated")
-		return cli.Result{}, cli.Invalid("invalid_selector",
-			"snapshot changed during replay; session was invalidated without publishing refs")
+		if durable.API.Worktree != nil && durable.API.Worktree.GitState == "clean" {
+			if removeErr := (restack.Replayer{Repo: rc.repo}).Remove(
+				ctx, durable.API.Worktree.Path); removeErr == nil {
+				durable.API.Worktree = nil
+			}
+		}
+		_, transitionErr := h.transitionSession(
+			ctx, j, stored.ID, stored.Revision, durable, "invalidated")
+		if transitionErr != nil {
+			return cli.Result{}, cli.Unavailable("journal_unavailable",
+				"cannot persist invalidated restack session", false)
+		}
+		return h.remoteChangedResult(inv.Name, captured.Stack, rc.repo.Dir,
+			stackRefMap(captured.Stack), stackRefMap(revalidated), &durable.API)
 	}
 	return h.publishSession(ctx, inv.Name, rc, j, stored, durable)
 }
 
 func (h *Handler) operationInProgress(ctx context.Context, command cli.CommandName, stack api.Stack,
-	j *journal.Journal, projectKey string) (cli.Result, error) {
+	cwd string, j *journal.Journal, projectKey string) (cli.Result, error) {
 	stored, err := j.ActiveSession(ctx, projectKey)
 	if err != nil {
 		return cli.Result{}, cli.Unavailable("journal_unavailable",
@@ -506,7 +517,30 @@ func (h *Handler) operationInProgress(ctx context.Context, command cli.CommandNa
 	if err != nil {
 		return cli.Result{}, cli.Internal("cannot create operation-in-progress finding", err)
 	}
+	if durable.API.Worktree != nil {
+		evidence, evidenceErr := factory.NewEvidence("managed_worktree", map[string]any{
+			"path": durable.API.Worktree.Path, "git_state": durable.API.Worktree.GitState,
+		})
+		if evidenceErr != nil {
+			return cli.Result{}, cli.Internal("cannot create active-session evidence", evidenceErr)
+		}
+		env.Evidence = append(env.Evidence, evidence)
+		finding.EvidenceRefs = append(finding.EvidenceRefs, evidence.EvidenceID)
+	}
+	work := api.RequiredWork{
+		Kind: "wait_for_external_state", ReasonCode: "operation_in_progress",
+	}
+	remediation, remediationErr := factory.NewRemediation(api.Remediation{
+		FindingID: finding.FindingID, Kind: "wait_and_recheck",
+		SessionID: &durable.API.SessionID, RequiredWork: &work,
+		EvidenceRefs: append([]string(nil), finding.EvidenceRefs...),
+		Actions:      []api.Action{recheckAction(stack.Remote.Name, cwd)},
+	})
+	if remediationErr != nil {
+		return cli.Result{}, cli.Internal("cannot create active-session remediation", remediationErr)
+	}
 	env.Findings = append(env.Findings, finding)
+	env.Remediations = append(env.Remediations, remediation)
 	env.ApplyFindingDisposition()
 	return result(env, finding.Summary)
 }
@@ -632,11 +666,90 @@ func (h *Handler) restackAbandon(ctx context.Context, inv cli.Invocation) (cli.R
 
 func (h *Handler) sessionResult(command cli.CommandName, session api.Session,
 	disposition api.Disposition, human string) (cli.Result, error) {
-	env, _, err := h.envelope(command)
+	env, factory, err := h.envelope(command)
 	if err != nil {
 		return cli.Result{}, cli.Internal("cannot create response envelope", err)
 	}
 	env.Session = &session
+	if disposition != api.DispositionComplete {
+		code := ""
+		switch {
+		case disposition == api.DispositionHumanRequired && session.State == "indeterminate_publication":
+			code = "indeterminate_publication"
+		case disposition == api.DispositionActionRequired && session.State == "retarget_pending":
+			code = "retarget_pending"
+		case disposition == api.DispositionWaiting && session.State == "retarget_pending":
+			code = "remote_visibility_pending"
+		case disposition == api.DispositionActionRequired && session.State == "publication_ready":
+			code = "remote_changed"
+		default:
+			return cli.Result{}, cli.Internal("unsupported session disposition packet", nil)
+		}
+		finding, findingErr := factory.NewFinding(code, disposition,
+			api.FindingScope{Kind: "session"}, human)
+		if findingErr != nil {
+			return cli.Result{}, cli.Internal("cannot create session finding", findingErr)
+		}
+		for _, ref := range session.Publication.Refs {
+			fields := map[string]any{
+				"branch": ref.Branch, "old_sha": ref.OldSHA,
+				"classification": ref.Classification,
+			}
+			if ref.NewSHA != nil {
+				fields["new_sha"] = *ref.NewSHA
+			}
+			if ref.CurrentSHA != nil {
+				fields["current_sha"] = *ref.CurrentSHA
+			}
+			evidence, evidenceErr := factory.NewEvidence("remote_ref", fields)
+			if evidenceErr != nil {
+				return cli.Result{}, cli.Internal("cannot create session evidence", evidenceErr)
+			}
+			env.Evidence = append(env.Evidence, evidence)
+			finding.EvidenceRefs = append(finding.EvidenceRefs, evidence.EvidenceID)
+		}
+		packet := api.Remediation{
+			FindingID: finding.FindingID, SessionID: &session.SessionID,
+			EvidenceRefs: append([]string(nil), finding.EvidenceRefs...), Actions: []api.Action{},
+		}
+		switch code {
+		case "indeterminate_publication":
+			packet.Kind = "recover_publication"
+			packet.RequiredWork = &api.RequiredWork{
+				Kind: "obtain_human_decision", ReasonCode: code,
+			}
+			packet.Actions = []api.Action{
+				sessionAction("recover_restack", session, "session_state_current"),
+			}
+		case "retarget_pending", "remote_visibility_pending":
+			packet.Kind = "retry_retarget"
+			packet.RequiredWork = &api.RequiredWork{
+				Kind: "wait_for_external_state", ReasonCode: code,
+			}
+			packet.Actions = []api.Action{
+				sessionAction("continue_restack", session, "session_state_current"),
+			}
+		case "remote_changed":
+			packet.Kind = "recover_publication"
+			packet.RequiredWork = &api.RequiredWork{
+				Kind: "wait_for_external_state", ReasonCode: code,
+			}
+			packet.Actions = []api.Action{
+				sessionAction("continue_restack", session,
+					"session_state_current", "remote_all_old"),
+				sessionAction("abort_restack", session,
+					"session_state_current", "no_remote_publication"),
+			}
+		}
+		remediation, remediationErr := factory.NewRemediation(packet)
+		if remediationErr != nil {
+			return cli.Result{}, cli.Internal("cannot create session remediation", remediationErr)
+		}
+		env.Findings = append(env.Findings, finding)
+		env.Remediations = append(env.Remediations, remediation)
+		env.ApplyFindingDisposition()
+		return result(env, human)
+	}
 	env.Disposition = &disposition
 	return result(env, human)
 }
@@ -758,10 +871,10 @@ func (h *Handler) completePublishedSession(ctx context.Context, command cli.Comm
 		return cli.Result{}, cli.Unavailable("journal_unavailable",
 			"refs published but completion could not be recorded", false)
 	}
-	var stale []string
+	var stale []gitexec.LocalRefResult
 	for _, local := range localResults {
 		if local.State != "updated" && local.State != "absent" {
-			stale = append(stale, local.Branch)
+			stale = append(stale, local)
 		}
 	}
 	if len(stale) == 0 {
@@ -779,7 +892,31 @@ func (h *Handler) completePublishedSession(ctx context.Context, command cli.Comm
 	if findingErr != nil {
 		return cli.Result{}, cli.Internal("cannot create local checkout finding", findingErr)
 	}
-	finding.Details["branches"] = stale
+	branches := make([]string, 0, len(stale))
+	for _, local := range stale {
+		branches = append(branches, local.Branch)
+		evidence, evidenceErr := factory.NewEvidence("local_worktree", map[string]any{
+			"branch": local.Branch, "git_state": local.State, "commit_sha": local.OldOID,
+		})
+		if evidenceErr != nil {
+			return cli.Result{}, cli.Internal("cannot create stale-checkout evidence", evidenceErr)
+		}
+		env.Evidence = append(env.Evidence, evidence)
+		finding.EvidenceRefs = append(finding.EvidenceRefs, evidence.EvidenceID)
+		work := api.RequiredWork{
+			Kind: "refresh_local_checkout", Branch: local.Branch, ExpectedSHA: local.NewOID,
+		}
+		remediation, remediationErr := factory.NewRemediation(api.Remediation{
+			FindingID: finding.FindingID, Kind: "refresh_local_checkout",
+			RequiredWork: &work, EvidenceRefs: []string{evidence.EvidenceID},
+			Actions: []api.Action{},
+		})
+		if remediationErr != nil {
+			return cli.Result{}, cli.Internal("cannot create stale-checkout remediation", remediationErr)
+		}
+		env.Remediations = append(env.Remediations, remediation)
+	}
+	finding.Details["branches"] = branches
 	env.Findings = append(env.Findings, finding)
 	env.ApplyFindingDisposition()
 	return result(env, finding.Summary)
@@ -839,9 +976,20 @@ func (h *Handler) restackSession(ctx context.Context, inv cli.Invocation) (cli.R
 				return cli.Result{}, refreshErr
 			}
 			if current.SnapshotID != stored.SnapshotID {
-				_, _ = h.transitionSession(ctx, j, stored.ID, stored.Revision, &durable, "invalidated")
-				return cli.Result{}, cli.Invalid("invalid_selector",
-					"snapshot changed before publication retry; session was invalidated")
+				if durable.API.Worktree != nil && durable.API.Worktree.GitState == "clean" {
+					if removeErr := (restack.Replayer{Repo: rc.repo}).Remove(
+						ctx, durable.API.Worktree.Path); removeErr == nil {
+						durable.API.Worktree = nil
+					}
+				}
+				_, transitionErr := h.transitionSession(
+					ctx, j, stored.ID, stored.Revision, &durable, "invalidated")
+				if transitionErr != nil {
+					return cli.Result{}, cli.Unavailable("journal_unavailable",
+						"cannot persist invalidated restack session", false)
+				}
+				return h.remoteChangedResult(inv.Name, captured.Stack, rc.repo.Dir,
+					stackRefMap(captured.Stack), stackRefMap(current), &durable.API)
 			}
 			return h.publishSession(ctx, inv.Name, rc, j, stored, &durable)
 		case "publication_pending_reconcile", "indeterminate_publication":
@@ -861,6 +1009,20 @@ func (h *Handler) resumeReplay(ctx context.Context, inv cli.Invocation, rc repos
 	j *journal.Journal, stored journal.Session, durable *durableSession) (cli.Result, error) {
 	if durable.API.Worktree == nil || durable.API.CurrentLayer == nil {
 		return cli.Result{}, cli.Internal("paused replay session lacks managed worktree state", nil)
+	}
+	if durable.ReplayLayer < 0 || durable.ReplayLayer >= len(durable.Plan.Layers) ||
+		durable.ReplayCommit < 0 ||
+		durable.ReplayCommit >= len(durable.Plan.Layers[durable.ReplayLayer].Commits) ||
+		len(durable.CompletedHeads) != durable.ReplayLayer ||
+		durable.API.CurrentLayer.MRIID != durable.Plan.Layers[durable.ReplayLayer].MRIID ||
+		durable.API.CurrentLayer.OriginalCommitSHA !=
+			durable.Plan.Layers[durable.ReplayLayer].Commits[durable.ReplayCommit].OID {
+		return cli.Result{}, cli.Internal("restack journal replay cursor is invalid", nil)
+	}
+	for _, head := range durable.CompletedHeads {
+		if !fullOID(head) {
+			return cli.Result{}, cli.Internal("restack journal replay cursor is invalid", nil)
+		}
 	}
 	var resolution restack.Resolution
 	switch stored.State {

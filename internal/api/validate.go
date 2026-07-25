@@ -159,6 +159,28 @@ func validateReferences(e Envelope) error {
 		if item.SessionID != nil && (e.Session == nil || *item.SessionID != e.Session.SessionID) {
 			return fmt.Errorf("api: remediation %q session binding disagrees with session", item.RemediationID)
 		}
+		if item.PlanID != nil && !envelopeHasPlanID(e, *item.PlanID) {
+			return fmt.Errorf("api: remediation %q plan binding disagrees with envelope", item.RemediationID)
+		}
+		if item.Member != nil {
+			if e.Stack == nil || item.Member.Position < 0 ||
+				item.Member.Position >= len(e.Stack.Members) ||
+				e.Stack.Members[item.Member.Position].IID != item.Member.IID {
+				return fmt.Errorf("api: remediation %q member binding disagrees with stack", item.RemediationID)
+			}
+		}
+		if item.Layer != nil {
+			if !envelopeHasLayer(e, *item.Layer) {
+				return fmt.Errorf("api: remediation %q layer binding disagrees with envelope", item.RemediationID)
+			}
+		}
+		if item.Worktree != nil {
+			if e.Session == nil || e.Session.Worktree == nil ||
+				item.Worktree.Path != e.Session.Worktree.Path ||
+				item.Worktree.GitState != e.Session.Worktree.GitState {
+				return fmt.Errorf("api: remediation %q worktree binding disagrees with session", item.RemediationID)
+			}
+		}
 		for _, action := range item.Actions {
 			if action.Requires.SnapshotID != nil &&
 				(e.Stack == nil || *action.Requires.SnapshotID != e.Stack.SnapshotID) {
@@ -168,9 +190,47 @@ func validateReferences(e Envelope) error {
 				(e.Session == nil || *action.Requires.SessionID != e.Session.SessionID) {
 				return fmt.Errorf("api: action %q session binding disagrees with session", action.Kind)
 			}
+			if action.Requires.PlanID != nil && !envelopeHasPlanID(e, *action.Requires.PlanID) {
+				return fmt.Errorf("api: action %q plan binding disagrees with envelope", action.Kind)
+			}
 		}
 	}
 	return nil
+}
+
+func envelopeHasPlanID(e Envelope, planID string) bool {
+	if e.Session != nil && e.Session.PlanID != nil && *e.Session.PlanID == planID {
+		return true
+	}
+	plan, ok := e.Data["plan"].(Plan)
+	return ok && plan.PlanID == planID
+}
+
+func envelopeHasLayer(e Envelope, layer RemediationLayer) bool {
+	if e.Session != nil && e.Session.CurrentLayer != nil {
+		current := e.Session.CurrentLayer
+		if current.MRIID != layer.MRIID {
+			return false
+		}
+		if layer.CommitSHA != nil && current.OriginalCommitSHA != *layer.CommitSHA {
+			return false
+		}
+		return layer.BoundarySHA == nil
+	}
+	if e.Stack == nil {
+		return false
+	}
+	for _, member := range e.Stack.Members {
+		if member.IID != layer.MRIID {
+			continue
+		}
+		if layer.BoundarySHA != nil &&
+			(member.Layer.BoundarySHA == nil || *member.Layer.BoundarySHA != *layer.BoundarySHA) {
+			return false
+		}
+		return layer.CommitSHA == nil
+	}
+	return false
 }
 
 func validateStack(s *Stack) error {

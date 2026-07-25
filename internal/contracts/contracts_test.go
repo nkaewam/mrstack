@@ -14,6 +14,7 @@ import (
 
 	"github.com/nkaewam/mrstack/internal/cli"
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	"gopkg.in/yaml.v3"
 )
 
 func repositoryRoot(t *testing.T) string {
@@ -128,6 +129,51 @@ func TestDocumentationLinks(t *testing.T) {
 			if _, err := os.Stat(resolved); err != nil {
 				t.Errorf("%s: broken link %q (%s)", file, string(match[1]), resolved)
 			}
+		}
+	}
+}
+
+func TestReleaseWorkflowRunsCompleteNonLiveGate(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(repositoryRoot(t), ".github", "workflows", "release.yml")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document yaml.Node
+	if err := yaml.Unmarshal(content, &document); err != nil {
+		t.Fatalf("release workflow is not valid YAML: %v", err)
+	}
+
+	required := []string{
+		`test -z "$(gofmt -l .)"`,
+		"go vet ./...",
+		"go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 ./...",
+		"go test ./internal/api ./internal/cli ./internal/contracts",
+		"go test -run TestDocumentationLinks ./internal/contracts",
+		"go test -shuffle=on -count=1 ./...",
+		"go test -race -shuffle=on -count=1 ./...",
+		"needs: verify",
+		"goos: [linux, darwin]",
+		"goarch: [amd64, arm64]",
+		`CGO_ENABLED: "0"`,
+		"go build -trimpath",
+	}
+	for _, want := range required {
+		if !bytes.Contains(content, []byte(want)) {
+			t.Errorf("release workflow is missing non-live gate %q", want)
+		}
+	}
+
+	action := regexp.MustCompile(`(?m)^\s*-\s+uses:\s+[^@\s]+@([^\s#]+)`)
+	fullCommit := regexp.MustCompile(`^[0-9a-f]{40}$`)
+	matches := action.FindAllSubmatch(content, -1)
+	if len(matches) == 0 {
+		t.Fatal("release workflow contains no actions")
+	}
+	for _, match := range matches {
+		if !fullCommit.Match(match[1]) {
+			t.Errorf("release action is not pinned to a full commit SHA: %s", match[0])
 		}
 	}
 }

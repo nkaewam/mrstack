@@ -20,9 +20,9 @@ func TestAssessCI_C01_C09_C12(t *testing.T) {
 	}{
 		{"current success", CIPolicyRequired, []Pipeline{{ID: 1, MRIID: 4, Kind: PipelineBranch, SourceSHA: "source", AssociatedWithMR: true, Status: "success"}}, "", "", true},
 		{"older green never counts C02", CIPolicyRequired, []Pipeline{{ID: 1, MRIID: 4, Kind: PipelineBranch, SourceSHA: "old", AssociatedWithMR: true, Status: "success"}}, FindingMissingRequiredPipeline, DispositionWaiting, false},
-		{"branch association missing C05", CIPolicyRequired, []Pipeline{{ID: 1, MRIID: 4, Kind: PipelineBranch, SourceSHA: "source", Status: "success"}}, FindingAmbiguousPipeline, DispositionHumanRequired, false},
+		{"exact branch pipeline needs no MR association", CIPolicyRequired, []Pipeline{{ID: 1, MRIID: 4, Kind: PipelineBranch, SourceSHA: "source", Status: "success"}}, "", "", true},
 		{"failed C03", CIPolicyRequired, []Pipeline{{ID: 2, MRIID: 4, Kind: PipelineDetachedMR, SourceSHA: "source", AssociatedWithMR: true, Status: "failed", FailedJobIDs: []int64{9, 3}}}, FindingCIFailed, DispositionActionRequired, true},
-		{"detached association missing C05", CIPolicyRequired, []Pipeline{{ID: 2, MRIID: 4, Kind: PipelineDetachedMR, SourceSHA: "source", Status: "success"}}, FindingAmbiguousPipeline, DispositionHumanRequired, false},
+		{"exact detached pipeline needs no MR association", CIPolicyRequired, []Pipeline{{ID: 2, MRIID: 4, Kind: PipelineDetachedMR, SourceSHA: "source", Status: "success"}}, "", "", true},
 		{"unknown pipeline kind C05", CIPolicyRequired, []Pipeline{{ID: 2, MRIID: 4, Kind: PipelineUnknown, SourceSHA: "source", Status: "success"}}, FindingAmbiguousPipeline, DispositionHumanRequired, false},
 		{"merged result parents forward C04", CIPolicyRequired, []Pipeline{{ID: 3, MRIID: 4, Kind: PipelineMergedResult, SourceSHA: "source", AssociatedWithMR: true, SyntheticParents: []string{"source", "target"}, Status: "success"}}, "", "", true},
 		{"merged result parents reverse C04", CIPolicyRequired, []Pipeline{{ID: 3, MRIID: 4, Kind: PipelineMergedResult, SourceSHA: "source", AssociatedWithMR: true, SyntheticParents: []string{"target", "source"}, Status: "success"}}, "", "", true},

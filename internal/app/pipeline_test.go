@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -134,6 +135,96 @@ func TestCheckPipelineEvidenceIsSchemaValidForValidAndAmbiguousMergedResults(t *
 				}
 			} else if pipeline.Currentness != "ambiguous" || pipeline.Kind != nil {
 				t.Fatalf("ambiguous pipeline leaked moving identity: %+v", pipeline)
+			}
+			if tt.disposition == "human_required" {
+				assertActionPacket(t, stdout.String(), "ambiguous_pipeline", "human_handoff")
+			}
+		})
+	}
+}
+
+func TestCheckExactSourcePipelineDoesNotRequireMRAssociation(t *testing.T) {
+	tests := []struct {
+		name        string
+		source      string
+		refForIID   func(int) string
+		wantAPIKind string
+	}{
+		{
+			name: "branch", source: "push",
+			refForIID: func(int) string { return "feature/one" }, wantAPIKind: "branch",
+		},
+		{
+			name: "detached merge request", source: "merge_request_event",
+			refForIID:   func(iid int) string { return "refs/merge-requests/" + strconv.Itoa(iid) + "/head" },
+			wantAPIKind: "detached_mr",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, _, mainOID, sourceOID, _ := createStackRepository(t)
+			mrs, err := json.Marshal([]map[string]any{{
+				"iid": 1, "state": "opened", "source_branch": "feature/one", "target_branch": "main",
+				"sha": sourceOID, "web_url": "https://gitlab.example/group/project/-/merge_requests/1",
+				"author":        map[string]any{"id": 7, "username": "developer"},
+				"diff_refs":     map[string]any{"base_sha": mainOID, "head_sha": sourceOID, "start_sha": mainOID},
+				"head_pipeline": map[string]any{"id": 9},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var calls [][]string
+			handler := &Handler{
+				Runner: fakeGlabRunner{
+					calls: &calls,
+					responses: map[string]json.RawMessage{
+						"/version": json.RawMessage(`{"version":"18.11.2"}`),
+						"/projects/group%2Fproject": json.RawMessage(`{
+							"id":42,"path_with_namespace":"group/project",
+							"web_url":"https://gitlab.example/group/project","default_branch":"main",
+							"only_allow_merge_if_pipeline_succeeds":true
+						}`),
+						"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
+						"/projects/42/pipelines/9": json.RawMessage(`{
+							"id":9,"sha":"` + sourceOID + `","ref":"` + tt.refForIID(1) + `",
+							"status":"success","source":"` + tt.source + `",
+							"web_url":"https://gitlab.example/pipelines/9"
+						}`),
+					},
+				},
+				Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
+				Now: func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
+			}
+			var stdout, stderr bytes.Buffer
+			exit := cli.RunWithHandler([]string{
+				"--json", "--no-input", "--remote", "origin", "check", "feature/one",
+			}, &stdout, &stderr, handler)
+			if exit != 0 {
+				t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout.String(), stderr.String())
+			}
+			for _, call := range calls {
+				if strings.Contains(strings.Join(call, " "), "/pipelines/9/merge_requests") {
+					t.Fatalf("exact-source %s pipeline queried unnecessary MR association: %q", tt.name, call)
+				}
+			}
+			var envelope struct {
+				Disposition string `json:"disposition"`
+				Stack       struct {
+					Members []struct {
+						Pipeline struct {
+							Currentness string  `json:"currentness"`
+							Kind        *string `json:"kind"`
+						} `json:"pipeline"`
+					} `json:"members"`
+				} `json:"stack"`
+			}
+			if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+				t.Fatalf("decode output: %v\n%s", err, stdout.String())
+			}
+			pipeline := envelope.Stack.Members[0].Pipeline
+			if envelope.Disposition != "ready" || pipeline.Currentness != "exact" ||
+				pipeline.Kind == nil || *pipeline.Kind != tt.wantAPIKind {
+				t.Fatalf("pipeline was not accepted as exact current: %+v\n%s", envelope, stdout.String())
 			}
 		})
 	}

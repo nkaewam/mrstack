@@ -51,10 +51,6 @@ func AssessCI(member MergeRequest, policy CIPolicy, pipelines []Pipeline) CIAsse
 		}
 		switch pipeline.Kind {
 		case PipelineBranch, PipelineDetachedMR:
-			if !pipeline.AssociatedWithMR {
-				ambiguous = true
-				continue
-			}
 			exact = append(exact, pipeline)
 		case PipelineMergedResult:
 			if !pipeline.AssociatedWithMR || !sameTwoParents(pipeline.SyntheticParents, member.SourceSHA, member.TargetSHA) {

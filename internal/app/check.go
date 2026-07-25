@@ -178,7 +178,7 @@ func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (
 		if p.ID.String() != head.ID.String() {
 			domainPipeline.Kind = stack.PipelineUnknown
 		}
-		if kind != stack.PipelineUnknown {
+		if kind == stack.PipelineMergedResult {
 			associated, associationErr := rc.client.PipelineMergeRequests(
 				ctx, rc.project.ID.String(), head.ID.String())
 			if associationErr != nil {
@@ -285,6 +285,9 @@ func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (
 		env.Disposition = &d
 	} else {
 		env.ApplyFindingDisposition()
+	}
+	if err := h.attachCheckPackets(&env, factory, rc.repo.Dir); err != nil {
+		return cli.Result{}, cli.Internal("cannot create check remediation packets", err)
 	}
 
 	human := renderCheck(apiStack, api.Disposition(disposition), env.Findings)

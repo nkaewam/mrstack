@@ -20,8 +20,19 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+      - name: Formatting
+        run: test -z "$(gofmt -l .)"
       - run: go vet ./...
-      - run: go test -race -shuffle=on -count=1 ./...
+      - name: Static analysis
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 ./...
+      - name: Public contract
+        run: go test ./internal/api ./internal/cli ./internal/contracts
+      - name: Documentation contract
+        run: go test -run TestDocumentationLinks ./internal/contracts
+      - name: Unit and integration tests
+        run: go test -shuffle=on -count=1 ./...
+      - name: Race
+        run: go test -race -shuffle=on -count=1 ./...
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}

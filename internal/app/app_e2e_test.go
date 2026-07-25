@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,41 @@ type fakeGlabRunner struct {
 	calls      *[][]string
 	rejectPush bool
 	dynamic    func(string, []string) (gitexec.Result, error)
+}
+
+type plannerShapeRunner struct {
+	fakeGlabRunner
+	shape string
+}
+
+func (r plannerShapeRunner) Run(
+	ctx context.Context, dir, command string, args ...string,
+) (gitexec.Result, error) {
+	if command == "git" && len(args) >= 3 && args[0] == "log" &&
+		args[1] == "--reverse" && strings.Contains(args[2], "%G?") {
+		result, err := r.ExecRunner.Run(ctx, dir, command, args...)
+		if err != nil {
+			return result, err
+		}
+		switch r.shape {
+		case "signed":
+			result.Stdout = bytes.ReplaceAll(result.Stdout, []byte("\x00N"), []byte("\x00G"))
+		case "merge":
+			lines := strings.Split(strings.TrimSpace(string(result.Stdout)), "\n")
+			if len(lines) > 0 {
+				fields := strings.Split(lines[0], "\x00")
+				if len(fields) == 3 {
+					fields[1] += " " + strings.Repeat("f", 40)
+					lines[0] = strings.Join(fields, "\x00")
+					result.Stdout = []byte(strings.Join(lines, "\n") + "\n")
+				}
+			}
+		case "empty":
+			result.Stdout = nil
+		}
+		return result, nil
+	}
+	return r.fakeGlabRunner.Run(ctx, dir, command, args...)
 }
 
 func (r fakeGlabRunner) Run(ctx context.Context, dir, command string, args ...string) (gitexec.Result, error) {
@@ -215,6 +251,7 @@ func TestRestackPublishesAffectedSuffixOnceAndEmitsSchemaValidSession(t *testing
 	if checkEnvelope.Disposition != "action_required" || checkEnvelope.Stack.SnapshotID == "" {
 		t.Fatalf("expected stale stack snapshot, got %s", checked.String())
 	}
+	assertActionPacket(t, checked.String(), "restack_required", "restack", "start_restack")
 
 	var stdout, stderr bytes.Buffer
 	exit = cli.RunWithHandler([]string{
@@ -259,6 +296,7 @@ func TestRestackPublishesAffectedSuffixOnceAndEmitsSchemaValidSession(t *testing
 		result.Session.Publication.State != "all_new" || len(result.Session.Publication.Refs) != 2 {
 		t.Fatalf("unexpected restack result: %s", stdout.String())
 	}
+	assertActionPacket(t, stdout.String(), "local_checkout_stale", "refresh_local_checkout")
 	for _, ref := range result.Session.Publication.Refs {
 		if ref.NewSHA == nil || ref.CurrentSHA == nil || *ref.NewSHA != *ref.CurrentSHA ||
 			ref.Classification != "new" || ref.OldSHA == *ref.NewSHA {
@@ -308,6 +346,33 @@ func TestRestackConflictContinueRequiresResolvedAndExplicitlyStagedWork(t *testi
 	assertPublishedSchema(t, start.stdout)
 	assertActionPacket(t, start.stdout, "rebase_conflict", "resolve_conflict",
 		"continue_restack")
+	var packet api.Envelope
+	if err := json.Unmarshal([]byte(start.stdout), &packet); err != nil {
+		t.Fatal(err)
+	}
+	var continueAction *api.Action
+	for index := range packet.Remediations[0].Actions {
+		if packet.Remediations[0].Actions[index].Kind == "continue_restack" {
+			continueAction = &packet.Remediations[0].Actions[index]
+		}
+	}
+	if continueAction == nil || !containsArgPair(continueAction.Argv, "--remote", "origin") {
+		t.Fatalf("continue packet lacks explicit session remote: %s", start.stdout)
+	}
+	detachedHandler := Handler{
+		Runner:   handler.Runner,
+		Dir:      continueAction.CWD,
+		StateDir: handler.StateDir,
+		Now:      handler.Now,
+	}
+	var dispatchedOut, dispatchedErr bytes.Buffer
+	dispatchedExit := cli.RunWithHandler(
+		continueAction.Argv[1:], &dispatchedOut, &dispatchedErr, &detachedHandler)
+	if dispatchedExit != 2 || strings.Contains(dispatchedOut.String(), "detached HEAD") {
+		t.Fatalf("packet argv did not dispatch from declared detached CWD: exit=%d out=%s err=%s",
+			dispatchedExit, dispatchedOut.String(), dispatchedErr.String())
+	}
+	assertPublishedSchema(t, dispatchedOut.String())
 
 	refused := runMachine(t, handler, "--yes", "restack", "continue", "--session", session.ID)
 	if refused.exit != 2 {
@@ -383,6 +448,179 @@ func TestRestackBlocksUncheckedOutLocalAheadBranchAuthoritatively(t *testing.T) 
 	}
 }
 
+func TestRestackDefaultBranchMovementIsAuthoritativeBeforeAndAfterReplay(t *testing.T) {
+	for _, timing := range []string{"before_replay", "after_replay"} {
+		t.Run(timing, func(t *testing.T) {
+			handler, snapshotID, repo, updater, calls := movingBaseRestackFixture(t)
+			oldOne := runGit(t, repo, "ls-remote", "origin", "refs/heads/feature/one")
+			oldTwo := runGit(t, repo, "ls-remote", "origin", "refs/heads/feature/two")
+			advance := func() {
+				if err := os.WriteFile(filepath.Join(updater, "moved-"+timing+".txt"),
+					[]byte("moved\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				runGit(t, updater, "add", ".")
+				runGit(t, updater, "commit", "-m", "move base "+timing)
+				runGit(t, updater, "push", "origin", "main")
+			}
+			if timing == "before_replay" {
+				advance()
+			} else {
+				runner := handler.Runner.(fakeGlabRunner)
+				var refreshes int
+				runner.dynamic = func(endpoint string, _ []string) (gitexec.Result, error) {
+					if endpoint == "/projects/42/merge_requests?state=all&scope=all&per_page=100" {
+						refreshes++
+						if refreshes == 2 {
+							advance()
+						}
+					}
+					return gitexec.Result{}, nil
+				}
+				handler.Runner = runner
+			}
+			start := runMachine(t, handler, "--yes", "restack", "--snapshot", snapshotID)
+			if start.exit != 0 || strings.Contains(strings.ToLower(start.stdout), "prompt") {
+				t.Fatalf("remote movement must be authoritative and noninteractive: %+v", start)
+			}
+			assertPublishedSchema(t, start.stdout)
+			assertActionPacket(t, start.stdout, "remote_changed", "wait_and_recheck", "recheck")
+			if timing == "after_replay" {
+				session := decodeSession(t, start.stdout)
+				if session.State != "invalidated" || session.Worktree != nil {
+					t.Fatalf("post-replay movement did not cleanly invalidate: %s", start.stdout)
+				}
+			}
+			if got := runGit(t, repo, "ls-remote", "origin", "refs/heads/feature/one"); got != oldOne {
+				t.Fatalf("feature/one published during invalidation: %s != %s", got, oldOne)
+			}
+			if got := runGit(t, repo, "ls-remote", "origin", "refs/heads/feature/two"); got != oldTwo {
+				t.Fatalf("feature/two published during invalidation: %s != %s", got, oldTwo)
+			}
+			for _, call := range *calls {
+				if len(call) > 1 && call[0] == "git" && call[1] == "push" {
+					t.Fatalf("remote movement sent publication push: %q", call)
+				}
+			}
+		})
+	}
+}
+
+func TestRestackPreflightShapesAreAuthoritativeAndNeverPublish(t *testing.T) {
+	tests := []struct {
+		shape, code, remediation string
+	}{
+		{"signed", "signed_commits", "authorize_signature_loss"},
+		{"merge", "merge_commit_in_layer", "human_handoff"},
+		{"empty", "empty_layer", "human_handoff"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.shape, func(t *testing.T) {
+			handler, snapshotID, repo, _, calls := movingBaseRestackFixture(t)
+			handler.Runner = plannerShapeRunner{
+				fakeGlabRunner: handler.Runner.(fakeGlabRunner), shape: tt.shape,
+			}
+			oldRefs := runGit(t, repo, "ls-remote", "--heads", "origin")
+			blocked := runMachine(t, handler, "--yes", "restack", "--snapshot", snapshotID)
+			if blocked.exit != 0 || strings.Contains(strings.ToLower(blocked.stdout), "prompt") {
+				t.Fatalf("%s blocker was not authoritative/noninteractive: %+v", tt.shape, blocked)
+			}
+			assertPublishedSchema(t, blocked.stdout)
+			assertActionPacket(t, blocked.stdout, tt.code, tt.remediation)
+			if got := runGit(t, repo, "ls-remote", "--heads", "origin"); got != oldRefs {
+				t.Fatalf("%s blocker changed remote refs", tt.shape)
+			}
+			for _, call := range *calls {
+				if len(call) > 1 && call[0] == "git" && call[1] == "push" {
+					t.Fatalf("%s blocker attempted publication: %q", tt.shape, call)
+				}
+			}
+			if tt.shape == "signed" {
+				allowed := runMachine(t, handler, "--yes", "restack", "--snapshot", snapshotID,
+					"--allow-signature-loss")
+				if allowed.exit != 0 {
+					t.Fatalf("explicit signature-loss authorization failed: %s", allowed.stdout)
+				}
+				assertPublishedSchema(t, allowed.stdout)
+				var envelope api.Envelope
+				if err := json.Unmarshal([]byte(allowed.stdout), &envelope); err != nil {
+					t.Fatal(err)
+				}
+				if envelope.Session == nil || !envelope.Session.SignatureLossAuthorized {
+					t.Fatalf("signature-loss authorization was not journaled: %s", allowed.stdout)
+				}
+			}
+		})
+	}
+}
+
+func TestRestackPlanAmbiguousBoundaryIsAuthoritativeAndReadOnly(t *testing.T) {
+	handler, snapshotID, repo, _, calls := movingBaseRestackFixture(t)
+	unrelated := runGit(t, repo, "rev-parse", "refs/remotes/origin/main")
+	oldRefs := runGit(t, repo, "ls-remote", "--heads", "origin")
+	planned := runMachine(t, handler, "restack", "plan", "--snapshot", snapshotID,
+		"--layer-boundary", "1="+unrelated)
+	if planned.exit != 0 || strings.Contains(strings.ToLower(planned.stdout), "prompt") {
+		t.Fatalf("ambiguous boundary was not authoritative/noninteractive: %+v", planned)
+	}
+	assertPublishedSchema(t, planned.stdout)
+	assertActionPacket(t, planned.stdout, "ambiguous_layer_boundary", "human_handoff")
+	if got := runGit(t, repo, "ls-remote", "--heads", "origin"); got != oldRefs {
+		t.Fatal("ambiguous boundary changed remote refs")
+	}
+	for _, call := range *calls {
+		if len(call) > 1 && call[0] == "git" && call[1] == "push" {
+			t.Fatalf("ambiguous boundary attempted publication: %q", call)
+		}
+	}
+}
+
+func TestMalformedDurableReplayCursorFailsInternallyWithoutPublishing(t *testing.T) {
+	handler, snapshotID := pausedSessionFixture(t, "conflict")
+	start := runMachine(t, handler, "--yes", "restack", "--snapshot", snapshotID)
+	session := decodeSession(t, start.stdout)
+	if start.exit != 0 || session.Worktree == nil {
+		t.Fatalf("conflict fixture did not pause: %s", start.stdout)
+	}
+	if err := os.WriteFile(filepath.Join(session.Worktree.Path, "shared.txt"),
+		[]byte("resolved\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, session.Worktree.Path, "add", "shared.txt")
+	j, err := handler.openJournal(handler.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := j.Session(context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var durable durableSession
+	if err := json.Unmarshal(stored.Payload, &durable); err != nil {
+		t.Fatal(err)
+	}
+	durable.ReplayLayer = len(durable.Plan.Layers) + 10
+	payload, _ := json.Marshal(durable)
+	j.Close()
+	db, err := sql.Open("sqlite", filepath.Join(handler.StateDir, "journal.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE sessions SET payload=? WHERE session_id=?`, payload, session.ID); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	oldRefs := runGit(t, handler.Dir, "ls-remote", "--heads", "origin")
+	resumed := runMachine(t, handler, "--yes", "restack", "continue", "--session", session.ID)
+	if resumed.exit != 4 || strings.Contains(strings.ToLower(resumed.stdout), "prompt") {
+		t.Fatalf("malformed cursor did not fail closed as internal: %+v", resumed)
+	}
+	assertPublishedSchema(t, resumed.stdout)
+	if got := runGit(t, handler.Dir, "ls-remote", "--heads", "origin"); got != oldRefs {
+		t.Fatal("malformed cursor published remote refs")
+	}
+}
+
 func TestConcurrentRestackStartReturnsAuthoritativeWaitingSession(t *testing.T) {
 	handler, snapshotID := pausedSessionFixture(t, "conflict")
 	first := runMachine(t, handler, "--yes", "restack", "--snapshot", snapshotID)
@@ -408,6 +646,7 @@ func TestConcurrentRestackStartReturnsAuthoritativeWaitingSession(t *testing.T) 
 		envelope.Findings[0].Code != "operation_in_progress" {
 		t.Fatalf("unexpected competing-start result: %s", second.stdout)
 	}
+	assertActionPacket(t, second.stdout, "operation_in_progress", "wait_and_recheck", "recheck")
 }
 
 func TestRestackPersistsCursorAcrossRepeatedConflictStops(t *testing.T) {
@@ -660,6 +899,58 @@ func TestCheckReconcilesTrackedFullyMergedStackOrFailsClosed(t *testing.T) {
 	}
 }
 
+func TestTrackedCompletionRejectsSameIIDsFromDifferentCanonicalProject(t *testing.T) {
+	repo, _, mainOID, firstOID, secondOID := createStackRepository(t)
+	mrs, _ := json.Marshal(stackMRPayload(mainOID, firstOID, secondOID, "opened", "", ""))
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	handler := &Handler{
+		Runner: fakeGlabRunner{responses: map[string]json.RawMessage{
+			"/version": json.RawMessage(`{"version":"18.11.2"}`),
+			"/projects/group%2Fproject": json.RawMessage(`{
+				"id":42,"path_with_namespace":"group/project",
+				"web_url":"https://gitlab.example/group/project","default_branch":"main",
+				"only_allow_merge_if_pipeline_succeeds":false
+			}`),
+			"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
+		}},
+		Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
+		Now: func() time.Time {
+			return now
+		},
+	}
+	observed := runMachine(t, handler, "check", "feature/two")
+	var historical api.Envelope
+	if observed.exit != 0 || json.Unmarshal([]byte(observed.stdout), &historical) != nil ||
+		historical.Stack == nil {
+		t.Fatalf("capture failed: %s", observed.stdout)
+	}
+	stackID := historical.Stack.StackID
+	historical.Stack.Project.Host = "other.gitlab.example"
+	historical.Stack.Project.PathWithNamespace = "other/project"
+	historical.Stack.Project.ID = "99"
+	historical.Stack.SnapshotID = "snp_cross_project"
+	payload, _ := json.Marshal(historical)
+	now = now.Add(time.Hour)
+	j, err := handler.openJournal(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = j.RecordObservation(context.Background(), journal.Observation{
+		ObservationID: "obs_cross_project", StackID: stackID,
+		ProjectKey: "gitlab.example/group/project", SnapshotID: "snp_cross_project",
+		Disposition: string(api.DispositionReady), Payload: payload,
+	})
+	j.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciled := runMachine(t, handler, "check", "--stack", stackID)
+	if reconciled.exit != 2 {
+		t.Fatalf("cross-project same-IID history was joined: %s", reconciled.stdout)
+	}
+	assertPublishedSchema(t, reconciled.stdout)
+}
+
 func stackMRPayload(base, first, second, state, firstIntegration, secondIntegration string) []map[string]any {
 	mergedAtOne, mergedAtTwo := "", ""
 	if state == "merged" {
@@ -805,6 +1096,7 @@ func TestLegacySquashAdvancementRetargetFailureIsDurableAndRetryOnly(t *testing.
 			start.exit, targetAttempts, start.stdout)
 	}
 	assertPublishedSchema(t, start.stdout)
+	assertActionPacket(t, start.stdout, "retarget_pending", "retry_retarget", "continue_restack")
 	var startEnvelope struct {
 		Session api.Session `json:"session"`
 	}
@@ -866,7 +1158,7 @@ func TestHumanAbandonArchivesIndeterminateSessionWithoutRemoteMutation(t *testin
 		Worktree:           &api.SessionWorktree{Path: worktree, GitState: "clean"},
 		AffectedMemberIIDs: []int{1},
 		Publication: api.Publication{State: "not_started", Refs: []api.PublicationRef{{
-			Branch: "feature", OldSHA: oldOID, CurrentSHA: &oldOID, Classification: "old",
+			Branch: "feature/one", OldSHA: oldOID, CurrentSHA: &oldOID, Classification: "old",
 		}}},
 		Resumable: true, Abortable: true,
 	}, ProjectID: "42"}
@@ -878,7 +1170,7 @@ func TestHumanAbandonArchivesIndeterminateSessionWithoutRemoteMutation(t *testin
 	if err := j.BeginSession(context.Background(), journal.Session{
 		ID: "ses_abandon", ProjectKey: "gitlab.example/group/project",
 		SnapshotID: "snp_abandon", State: "preparing",
-		OldRefs: map[string]string{"feature": oldOID}, NewRefs: map[string]string{},
+		OldRefs: map[string]string{"feature/one": oldOID}, NewRefs: map[string]string{},
 		Payload: payload,
 	}); err != nil {
 		t.Fatal(err)
@@ -889,13 +1181,13 @@ func TestHumanAbandonArchivesIndeterminateSessionWithoutRemoteMutation(t *testin
 		t.Fatal(err)
 	}
 	durable.API.Publication = api.Publication{State: "all_old", Refs: []api.PublicationRef{{
-		Branch: "feature", OldSHA: oldOID, NewSHA: &newOID,
+		Branch: "feature/one", OldSHA: oldOID, NewSHA: &newOID,
 		CurrentSHA: &oldOID, Classification: "old",
 	}}}
 	durable.API.State = "publication_ready"
 	payload, _ = json.Marshal(durable)
 	stored, err = j.PreparePublication(context.Background(), "ses_abandon",
-		stored.Revision, map[string]string{"feature": newOID}, payload)
+		stored.Revision, map[string]string{"feature/one": newOID}, payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -911,6 +1203,13 @@ func TestHumanAbandonArchivesIndeterminateSessionWithoutRemoteMutation(t *testin
 	if err := j.Close(); err != nil {
 		t.Fatal(err)
 	}
+	recovered := runMachine(t, handler, "restack", "recover", "--session", "ses_abandon")
+	if recovered.exit != 0 {
+		t.Fatalf("indeterminate recovery was not authoritative: %s", recovered.stdout)
+	}
+	assertPublishedSchema(t, recovered.stdout)
+	assertActionPacket(t, recovered.stdout, "indeterminate_publication",
+		"recover_publication", "recover_restack")
 
 	agent := runMachine(t, handler, "restack", "abandon", "--session", "ses_abandon",
 		"--accept-current-remote")
@@ -1016,6 +1315,15 @@ func assertActionPacket(t *testing.T, document, findingCode, remediationKind str
 	}
 }
 
+func containsArgPair(argv []string, key, value string) bool {
+	for index := 0; index+1 < len(argv); index++ {
+		if argv[index] == key && argv[index+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
 func pausedSessionFixture(t *testing.T, kind string) (*Handler, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -1114,6 +1422,46 @@ func pausedSessionFixture(t *testing.T, kind string) (*Handler, string) {
 		t.Fatal(err)
 	}
 	return handler, envelope.Stack.SnapshotID
+}
+
+func movingBaseRestackFixture(t *testing.T) (*Handler, string, string, string, *[][]string) {
+	t.Helper()
+	repo, remote, originalMain, firstOID, secondOID := createStackRepository(t)
+	runGit(t, repo, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(repo, "base-advanced.txt"), []byte("advanced\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "base-advanced.txt")
+	runGit(t, repo, "commit", "-m", "advance base")
+	runGit(t, repo, "push", "origin", "main")
+	runGit(t, repo, "checkout", "feature/two")
+	mrs, _ := json.Marshal(stackMRPayload(originalMain, firstOID, secondOID, "opened", "", ""))
+	var calls [][]string
+	handler := &Handler{
+		Runner: fakeGlabRunner{responses: map[string]json.RawMessage{
+			"/version": json.RawMessage(`{"version":"18.11.2"}`),
+			"/user":    json.RawMessage(`{"id":7,"username":"developer"}`),
+			"/projects/group%2Fproject": json.RawMessage(`{
+				"id":42,"path_with_namespace":"group/project",
+				"web_url":"https://gitlab.example/group/project","default_branch":"main",
+				"only_allow_merge_if_pipeline_succeeds":false
+			}`),
+			"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
+		}, calls: &calls},
+		Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
+		Now: func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
+	}
+	check := runMachine(t, handler, "check", "feature/two")
+	var envelope api.Envelope
+	if check.exit != 0 || json.Unmarshal([]byte(check.stdout), &envelope) != nil || envelope.Stack == nil {
+		t.Fatalf("moving-base fixture check failed: %s", check.stdout)
+	}
+	updater := filepath.Join(t.TempDir(), "updater")
+	runGit(t, filepath.Dir(updater), "clone", remote, updater)
+	runGit(t, updater, "config", "user.name", "Updater")
+	runGit(t, updater, "config", "user.email", "updater@example.invalid")
+	runGit(t, updater, "checkout", "main")
+	return handler, envelope.Stack.SnapshotID, repo, updater, &calls
 }
 
 func repositoryRoot(t *testing.T) string {
