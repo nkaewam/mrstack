@@ -35,6 +35,8 @@ const (
 	FindingCIPolicyUnknown            FindingCode = "ci_policy_unknown"
 	FindingPipelineStatusUnknown      FindingCode = "pipeline_status_unknown"
 	FindingPipelineRunning            FindingCode = "pipeline_running"
+	FindingMergeConflict              FindingCode = "merge_conflict"
+	FindingMergeabilityChecking       FindingCode = "mergeability_checking"
 	FindingInvalidArguments           FindingCode = "invalid_arguments"
 )
 

@@ -248,6 +248,8 @@ func (h *Handler) restackStart(ctx context.Context, inv cli.Invocation) (cli.Res
 		Publication:             api.Publication{State: "not_started", Refs: publicationRefs(capturedRefs, nil, capturedRefs)},
 		SignatureLossAuthorized: inv.AllowSignatureLoss, Resumable: true, Abortable: true,
 	}
+	worktreePath := filepath.Join(h.stateRoot(rc.repo.Dir), "worktrees", sessionID)
+	session.Worktree = &api.SessionWorktree{Path: worktreePath, GitState: "preparing"}
 	durable := durableSession{API: session, Plan: plan, ProjectID: current.Project.ID}
 	payload, err := json.Marshal(durable)
 	if err != nil {
@@ -263,6 +265,12 @@ func (h *Handler) restackStart(ctx context.Context, inv cli.Invocation) (cli.Res
 		}
 		return cli.Result{}, cli.Unavailable("journal_unavailable", "cannot begin restack session", false)
 	}
+	if h.Failpoint != nil {
+		if err := h.Failpoint("after_session_begin"); err != nil {
+			return cli.Result{}, cli.Unavailable("git_transport_failed",
+				"restack interrupted after durable session creation", true)
+		}
+	}
 	replayer := restack.Replayer{Repo: rc.repo}
 	worktree, err := replayer.Prepare(ctx, filepath.Join(h.stateRoot(rc.repo.Dir), "worktrees"),
 		sessionID, plan.BaseOID)
@@ -271,10 +279,26 @@ func (h *Handler) restackStart(ctx context.Context, inv cli.Invocation) (cli.Res
 		return cli.Result{}, cli.Unavailable("git_transport_failed",
 			"cannot create managed restack worktree", false)
 	}
-	durable.API.Worktree = &api.SessionWorktree{Path: worktree, GitState: "clean"}
+	if worktree != worktreePath {
+		_, _ = h.transitionSession(ctx, j, sessionID, 1, &durable, "invalidated")
+		return cli.Result{}, cli.Internal("managed worktree path changed during preparation", nil)
+	}
+	if h.Failpoint != nil {
+		if err := h.Failpoint("after_worktree_prepare"); err != nil {
+			return cli.Result{}, cli.Unavailable("git_transport_failed",
+				"restack interrupted after managed worktree preparation", true)
+		}
+	}
+	durable.API.Worktree.GitState = "replaying"
 	stored, err := h.transitionSession(ctx, j, sessionID, 1, &durable, "replaying")
 	if err != nil {
 		return cli.Result{}, cli.Unavailable("journal_unavailable", "cannot persist replay state", false)
+	}
+	if h.Failpoint != nil {
+		if err := h.Failpoint("after_replay_checkpoint"); err != nil {
+			return cli.Result{}, cli.Unavailable("git_transport_failed",
+				"restack interrupted after durable replay checkpoint", true)
+		}
 	}
 	newHeads, replayErr := replayer.Replay(ctx, worktree, plan)
 	if replayErr != nil {
@@ -834,10 +858,17 @@ func (h *Handler) finishTargetUpdate(ctx context.Context, command cli.CommandNam
 			fmt.Sprintf("Restack session %s published refs; legacy target update awaits retry", stored.ID))
 	}
 	if mr.State != update.ExpectedMRState ||
-		strings.ToLower(mr.SHA) != update.ExpectedSourceSHA ||
-		mr.TargetBranch != update.FromTarget {
+		strings.ToLower(mr.SHA) != update.ExpectedSourceSHA {
 		return h.sessionResult(command, durable.API, api.DispositionWaiting,
 			fmt.Sprintf("Restack session %s is waiting for GitLab to expose the published source revision", stored.ID))
+	}
+	if mr.TargetBranch == update.ToTarget {
+		update.Status = "applied"
+		return h.completePublishedSession(ctx, command, rc, j, stored, durable)
+	}
+	if mr.TargetBranch != update.FromTarget {
+		return h.sessionResult(command, durable.API, api.DispositionWaiting,
+			fmt.Sprintf("Restack session %s is waiting for GitLab to expose the expected target revision", stored.ID))
 	}
 	if err := rc.client.UpdateTarget(ctx, durable.ProjectID, update.MRIID, update.ToTarget); err != nil {
 		return h.sessionResult(command, durable.API, api.DispositionActionRequired,
@@ -955,6 +986,8 @@ func (h *Handler) restackSession(ctx context.Context, inv cli.Invocation) (cli.R
 		return h.recoverSession(ctx, inv.Name, rc, j, stored, &durable)
 	case cli.CommandRestackContinue:
 		switch stored.State {
+		case "preparing", "replaying":
+			return h.restartReplay(ctx, inv, rc, j, stored, &durable)
 		case "rebase_conflict", "empty_commit":
 			return h.resumeReplay(ctx, inv, rc, j, stored, &durable)
 		case "publication_ready":
@@ -1003,6 +1036,96 @@ func (h *Handler) restackSession(ctx context.Context, inv cli.Invocation) (cli.R
 	default:
 		return cli.Result{}, cli.Invalid("invalid_selector", "unsupported session command")
 	}
+}
+
+func (h *Handler) restartReplay(ctx context.Context, inv cli.Invocation, rc repositoryContext,
+	j *journal.Journal, stored journal.Session, durable *durableSession) (cli.Result, error) {
+	if durable.API.Worktree == nil || durable.API.Worktree.Path == "" {
+		return cli.Result{}, cli.Internal("replay restart lacks a durable managed worktree path", nil)
+	}
+	actual, err := rc.repo.RemoteRefs(ctx, rc.remoteName, sortedRefNames(stored.OldRefs))
+	if err != nil {
+		return cli.Result{}, cli.Unavailable("git_transport_failed",
+			"cannot verify remote refs before replay restart", true)
+	}
+	if journal.ReconcileRefs(stored.OldRefs, stored.OldRefs, actual) != journal.RefsAllOld {
+		_, captured, loadErr := h.loadSnapshot(ctx, inv.Globals.Remote, stored.SnapshotID)
+		if loadErr != nil {
+			return cli.Result{}, loadErr
+		}
+		return h.remoteChangedResult(inv.Name, captured.Stack, rc.repo.Dir,
+			stored.OldRefs, actual, &durable.API)
+	}
+	replayer := restack.Replayer{Repo: rc.repo}
+	if err := replayer.RemoveForce(ctx, durable.API.Worktree.Path); err != nil {
+		return cli.Result{}, cli.Unavailable("git_transport_failed",
+			"cannot reset managed worktree for replay recovery", false)
+	}
+	worktree, err := replayer.Prepare(ctx, filepath.Dir(durable.API.Worktree.Path),
+		stored.ID, durable.Plan.BaseOID)
+	if err != nil || worktree != durable.API.Worktree.Path {
+		return cli.Result{}, cli.Unavailable("git_transport_failed",
+			"cannot recreate managed worktree for replay recovery", false)
+	}
+	durable.API.Worktree.GitState = "replaying"
+	durable.API.CurrentLayer = nil
+	durable.ReplayLayer, durable.ReplayCommit = 0, 0
+	durable.CompletedHeads = nil
+	if stored.State == "preparing" {
+		stored, err = h.transitionSession(ctx, j, stored.ID, stored.Revision, durable, "replaying")
+		if err != nil {
+			return cli.Result{}, cli.Unavailable("journal_unavailable",
+				"cannot persist recovered replay state", false)
+		}
+	}
+	newHeads, replayErr := replayer.Replay(ctx, worktree, durable.Plan)
+	if replayErr != nil {
+		var stopped *restack.ReplayError
+		if errors.As(replayErr, &stopped) {
+			if _, err := h.persistReplayStop(ctx, rc, j, stored, durable, stopped); err != nil {
+				return cli.Result{}, cli.Unavailable("journal_unavailable",
+					"cannot persist recovered replay stop", false)
+			}
+			return h.replayStopResult(inv.Name, durable.API)
+		}
+		return cli.Result{}, cli.Unavailable("git_transport_failed",
+			"managed replay recovery failed", false)
+	}
+	return h.prepareAndPublish(ctx, inv, rc, j, stored, durable, newHeads)
+}
+
+func (h *Handler) replayRecoveryResult(command cli.CommandName,
+	session api.Session) (cli.Result, error) {
+	if session.Worktree == nil {
+		return cli.Result{}, cli.Internal("replay recovery lacks managed worktree", nil)
+	}
+	env, factory, err := h.envelope(command)
+	if err != nil {
+		return cli.Result{}, cli.Internal("cannot create replay recovery envelope", err)
+	}
+	env.Session = &session
+	finding, err := factory.NewFinding("operation_in_progress", api.DispositionWaiting,
+		api.FindingScope{Kind: "session"},
+		"managed replay was interrupted and can be restarted safely")
+	if err != nil {
+		return cli.Result{}, cli.Internal("cannot create replay recovery finding", err)
+	}
+	packet, err := factory.NewRemediation(api.Remediation{
+		FindingID: finding.FindingID, Kind: "wait_and_recheck",
+		SessionID: &session.SessionID,
+		RequiredWork: &api.RequiredWork{
+			Kind: "wait_for_external_state", ReasonCode: "operation_in_progress",
+		},
+		EvidenceRefs: []string{},
+		Actions:      []api.Action{recheckAction(session.Remote.Name, session.Worktree.Path)},
+	})
+	if err != nil {
+		return cli.Result{}, cli.Internal("cannot create replay recovery remediation", err)
+	}
+	env.Findings = append(env.Findings, finding)
+	env.Remediations = append(env.Remediations, packet)
+	env.ApplyFindingDisposition()
+	return result(env, finding.Summary)
 }
 
 func (h *Handler) resumeReplay(ctx context.Context, inv cli.Invocation, rc repositoryContext,
@@ -1106,7 +1229,8 @@ func (h *Handler) abortSession(ctx context.Context, rc repositoryContext, j *jou
 		}
 	}
 	if durable.API.Worktree != nil {
-		if _, err := rc.repo.Git(ctx, "worktree", "remove", "--force", durable.API.Worktree.Path); err != nil {
+		if err := (restack.Replayer{Repo: rc.repo}).RemoveForce(
+			ctx, durable.API.Worktree.Path); err != nil {
 			return cli.Result{}, cli.Unavailable("git_transport_failed",
 				"cannot remove managed restack worktree", false)
 		}
@@ -1126,6 +1250,19 @@ func (h *Handler) abortSession(ctx context.Context, rc repositoryContext, j *jou
 func (h *Handler) recoverSession(ctx context.Context, command cli.CommandName, rc repositoryContext,
 	j *journal.Journal, stored journal.Session, durable *durableSession) (cli.Result, error) {
 	switch stored.State {
+	case "preparing", "replaying":
+		actual, err := rc.repo.RemoteRefs(ctx, rc.remoteName, sortedRefNames(stored.OldRefs))
+		if err != nil {
+			return cli.Result{}, cli.Unavailable("git_transport_failed",
+				"cannot inspect remote refs for replay recovery", true)
+		}
+		if journal.ReconcileRefs(stored.OldRefs, stored.OldRefs, actual) != journal.RefsAllOld {
+			return cli.Result{}, cli.Invalid("invalid_selector",
+				"remote refs changed while replay recovery was pending")
+		}
+		// Recovery is deliberately read-only. Continue performs the idempotent
+		// managed-worktree reset and exact-plan replay.
+		return h.replayRecoveryResult(command, durable.API)
 	case "publication_pending_reconcile", "indeterminate_publication", "publication_ready":
 	default:
 		return cli.Result{}, cli.Invalid("invalid_selector",

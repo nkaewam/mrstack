@@ -166,11 +166,7 @@ func (h *Handler) remoteChangedResult(command cli.CommandName, stack api.Stack, 
 		env.Evidence = append(env.Evidence, evidence)
 		finding.EvidenceRefs = append(finding.EvidenceRefs, evidence.EvidenceID)
 	}
-	action := api.Action{
-		Kind: "recheck", Argv: []string{"mrstack", "check", "--json", "--no-input"},
-		CWD: cwd, Preconditions: []string{"repository_context_current"},
-		Requires: api.ActionRequirements{JobIDs: []string{}},
-	}
+	action := recheckAction(stack.Remote.Name, cwd)
 	work := api.RequiredWork{Kind: "wait_for_external_state", ReasonCode: "remote_changed"}
 	remediation, err := factory.NewRemediation(api.Remediation{
 		FindingID: finding.FindingID, Kind: "wait_and_recheck", RequiredWork: &work,
@@ -324,9 +320,22 @@ func (h *Handler) attachCheckPackets(env *api.Envelope, factory *api.Factory, cw
 					},
 				}}
 			case "pipeline_failed":
-				if member == nil || member.Pipeline == nil || member.Pipeline.ID == nil ||
-					len(member.Pipeline.FailedJobs) == 0 {
-					return fmt.Errorf("pipeline failure lacks pinned pipeline jobs")
+				if member == nil || member.Pipeline == nil || member.Pipeline.ID == nil {
+					return fmt.Errorf("pipeline failure lacks pinned pipeline")
+				}
+				if len(member.Pipeline.FailedJobs) == 0 {
+					// GitLab's aggregate failure may be propagated from a
+					// downstream bridge without exposing a direct failed job.
+					// Preserve the authoritative failure and offer only the
+					// safe operation available without inventing a job ID.
+					remediation.Kind = "wait_and_recheck"
+					remediation.RequiredWork = &api.RequiredWork{
+						Kind: "wait_for_external_state", ReasonCode: finding.Code,
+					}
+					remediation.Actions = []api.Action{
+						recheckAction(env.Stack.Remote.Name, cwd),
+					}
+					break
 				}
 				jobIDs := make([]string, 0, len(member.Pipeline.FailedJobs))
 				for _, job := range member.Pipeline.FailedJobs {
@@ -349,6 +358,11 @@ func (h *Handler) attachCheckPackets(env *api.Envelope, factory *api.Factory, cw
 						},
 					},
 					recheckAction(env.Stack.Remote.Name, cwd),
+				}
+			case "merge_conflict":
+				remediation.Kind = "human_handoff"
+				remediation.RequiredWork = &api.RequiredWork{
+					Kind: "obtain_human_decision", ReasonCode: finding.Code,
 				}
 			default:
 				return fmt.Errorf("unsupported actionable check finding %s", finding.Code)
@@ -373,9 +387,12 @@ func jobArgs(jobIDs []string) []string {
 
 func sessionAction(kind string, session api.Session, preconditions ...string) api.Action {
 	argv := []string{
-		"mrstack", "--json", "--no-input", "--yes", "--remote", session.Remote.Name,
-		"restack",
+		"mrstack", "--json", "--no-input",
 	}
+	if kind != "recover_restack" {
+		argv = append(argv, "--yes")
+	}
+	argv = append(argv, "--remote", session.Remote.Name, "restack")
 	switch kind {
 	case "continue_restack":
 		argv = append(argv, "continue", "--session", session.SessionID)

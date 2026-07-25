@@ -217,3 +217,21 @@ func (r Replayer) Remove(ctx context.Context, worktree string) error {
 	_, err := r.Repo.Git(ctx, "worktree", "remove", worktree)
 	return err
 }
+
+// RemoveForce discards only a managed worktree path. It is idempotent so a
+// crash between Git registering and materializing the worktree can be retried.
+func (r Replayer) RemoveForce(ctx context.Context, worktree string) error {
+	if r.Repo == nil || worktree == "" {
+		return errors.New("invalid managed worktree")
+	}
+	if _, err := r.Repo.Git(ctx, "worktree", "remove", "--force", worktree); err == nil {
+		return nil
+	}
+	if _, err := os.Stat(worktree); err == nil {
+		return errors.New("managed worktree could not be removed")
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	_, err := r.Repo.Git(ctx, "worktree", "prune")
+	return err
+}

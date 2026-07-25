@@ -348,7 +348,8 @@ func TestRemediationBuilderValidatesDiscriminatedPackets(t *testing.T) {
 	commit := strings.Repeat("a", 40)
 	valid := Remediation{
 		FindingID: "fnd_1", Kind: "choose_empty_commit", SessionID: &sessionID,
-		Layer: &RemediationLayer{MRIID: 7, CommitSHA: &commit},
+		Layer:    &RemediationLayer{MRIID: 7, CommitSHA: &commit},
+		Worktree: &SessionWorktree{Path: "/repo", GitState: "empty_commit"},
 		RequiredWork: &RequiredWork{
 			Kind: "choose_empty_commit_outcome", Options: []string{"drop_current", "keep_empty"},
 		},
@@ -376,8 +377,17 @@ func TestRemediationBuilderValidatesDiscriminatedPackets(t *testing.T) {
 }
 
 func validSessionAction(kind, sessionID, extraPrecondition string) Action {
+	transition := []string{"continue", "--session", sessionID}
+	switch kind {
+	case "continue_drop_current":
+		transition = append(transition, "--drop-current")
+	case "continue_keep_empty":
+		transition = append(transition, "--keep-empty")
+	}
 	return Action{
-		Kind: kind, Argv: []string{"mrstack", "restack", "continue", "--session", sessionID},
+		Kind: kind, Argv: append([]string{
+			"mrstack", "--json", "--no-input", "--yes", "--remote", "origin", "restack",
+		}, transition...),
 		CWD: "/repo", Mutates: true, ConfirmationRequired: true,
 		Preconditions: []string{"session_state_current", extraPrecondition},
 		Requires:      ActionRequirements{SessionID: &sessionID, JobIDs: []string{}},
@@ -613,7 +623,12 @@ func TestSessionCrossFieldValidation(t *testing.T) {
 func TestActionIdentityAndPreconditionValidation(t *testing.T) {
 	snapshot := "snap_1"
 	action := Action{
-		Kind: "start_restack", Argv: []string{"mrstack", "restack"}, CWD: "/repo",
+		Kind: "start_restack",
+		Argv: []string{
+			"mrstack", "--json", "--no-input", "--yes", "--remote", "origin",
+			"restack", "--snapshot", snapshot,
+		},
+		CWD:     "/repo",
 		Mutates: true, ConfirmationRequired: true, Preconditions: []string{"snapshot_current"},
 		Requires: ActionRequirements{SnapshotID: &snapshot, JobIDs: []string{}},
 	}
@@ -628,6 +643,165 @@ func TestActionIdentityAndPreconditionValidation(t *testing.T) {
 	action.Preconditions = append(action.Preconditions, "snapshot_current")
 	if err := validateAction(action); err == nil {
 		t.Fatal("duplicate precondition accepted")
+	}
+}
+
+func TestActionArgvMustMatchKindAndRequiredIdentities(t *testing.T) {
+	t.Parallel()
+	snapshot, plan, session, pipeline := "snap_1", "pln_1", "ses_1", "101"
+	base := func(kind string, argv []string, mutates bool, preconditions []string, requires ActionRequirements) Action {
+		globals := []string{"mrstack", "--json", "--no-input", "--remote", "origin"}
+		if mutates {
+			globals = append(globals, "--yes")
+		}
+		return Action{
+			Kind: kind, Argv: append(globals, argv...), CWD: "/repo", Mutates: mutates,
+			ConfirmationRequired: mutates, Preconditions: preconditions, Requires: requires,
+		}
+	}
+	valid := []Action{
+		base("start_restack", []string{"restack", "--snapshot", snapshot}, true,
+			[]string{"snapshot_current"}, ActionRequirements{SnapshotID: &snapshot, JobIDs: []string{}}),
+		base("start_planned_restack", []string{"restack", "--plan", plan}, true,
+			[]string{"snapshot_current", "plan_current"},
+			ActionRequirements{SnapshotID: &snapshot, PlanID: &plan, JobIDs: []string{}}),
+		base("continue_restack", []string{"restack", "continue", "--session", session}, true,
+			[]string{"session_state_current"}, ActionRequirements{SessionID: &session, JobIDs: []string{}}),
+		base("continue_drop_current", []string{"restack", "continue", "--session", session, "--drop-current"}, true,
+			[]string{"session_state_current", "empty_commit_current"},
+			ActionRequirements{SessionID: &session, JobIDs: []string{}}),
+		base("continue_keep_empty", []string{"restack", "continue", "--session", session, "--keep-empty"}, true,
+			[]string{"session_state_current", "empty_commit_current"},
+			ActionRequirements{SessionID: &session, JobIDs: []string{}}),
+		base("abort_restack", []string{"restack", "abort", "--session", session}, true,
+			[]string{"session_state_current", "no_remote_publication"},
+			ActionRequirements{SessionID: &session, JobIDs: []string{}}),
+		base("recover_restack", []string{"restack", "recover", "--session", session}, false,
+			[]string{"session_state_current"}, ActionRequirements{SessionID: &session, JobIDs: []string{}}),
+		base("fetch_ci_logs", []string{"ci", "logs", "--pipeline", pipeline, "--job", "7", "--job", "8"}, false,
+			[]string{"pipeline_and_jobs_pinned"},
+			ActionRequirements{PipelineID: &pipeline, JobIDs: []string{"7", "8"}}),
+		base("recheck", []string{"check"}, false, []string{"repository_context_current"},
+			ActionRequirements{JobIDs: []string{}}),
+	}
+	for _, action := range valid {
+		action := action
+		t.Run("valid_"+action.Kind, func(t *testing.T) {
+			if err := validateAction(action); err != nil {
+				t.Fatalf("valid action rejected: %v", err)
+			}
+		})
+	}
+
+	clone := func(action Action) Action {
+		action.Argv = append([]string(nil), action.Argv...)
+		action.Preconditions = append([]string(nil), action.Preconditions...)
+		action.Requires.JobIDs = append([]string(nil), action.Requires.JobIDs...)
+		return action
+	}
+	hostile := map[string]Action{
+		"substituted executable": clone(valid[0]),
+		"wrong subcommand":       clone(valid[2]),
+		"snapshot mismatch":      clone(valid[0]),
+		"plan mismatch":          clone(valid[1]),
+		"session mismatch":       clone(valid[2]),
+		"wrong empty choice":     clone(valid[3]),
+		"pipeline mismatch":      clone(valid[7]),
+		"job mismatch":           clone(valid[7]),
+		"log budget override":    clone(valid[7]),
+		"selector injection":     clone(valid[8]),
+		"mode override":          clone(valid[8]),
+		"remote omission":        clone(valid[8]),
+	}
+	hostile["substituted executable"].Argv[0] = "sh"
+	hostile["wrong subcommand"].Argv[len(hostile["wrong subcommand"].Argv)-3] = "check"
+	hostile["snapshot mismatch"].Argv[len(hostile["snapshot mismatch"].Argv)-1] = "snap_other"
+	hostile["plan mismatch"].Argv[len(hostile["plan mismatch"].Argv)-1] = "pln_other"
+	hostile["session mismatch"].Argv[len(hostile["session mismatch"].Argv)-1] = "ses_other"
+	hostile["wrong empty choice"].Argv[len(hostile["wrong empty choice"].Argv)-1] = "--keep-empty"
+	hostile["pipeline mismatch"].Argv[len(hostile["pipeline mismatch"].Argv)-4] = "102"
+	hostile["job mismatch"].Argv[len(hostile["job mismatch"].Argv)-1] = "9"
+	logBudgetOverride := hostile["log budget override"]
+	logBudgetOverride.Argv = append(logBudgetOverride.Argv, "--max-bytes", "1")
+	hostile["log budget override"] = logBudgetOverride
+	selectorInjection := hostile["selector injection"]
+	selectorInjection.Argv = append(selectorInjection.Argv, "attacker-branch")
+	hostile["selector injection"] = selectorInjection
+	modeOverride := hostile["mode override"]
+	modeOverride.Argv = append(modeOverride.Argv, "--gitlab-mode", "legacy")
+	hostile["mode override"] = modeOverride
+	remoteOmission := hostile["remote omission"]
+	remoteOmission.Argv = []string{"mrstack", "--json", "--no-input", "check"}
+	hostile["remote omission"] = remoteOmission
+	for name, action := range hostile {
+		action := action
+		t.Run(name, func(t *testing.T) {
+			if err := validateAction(action); err == nil {
+				t.Fatalf("hostile argv accepted: %#v", action.Argv)
+			}
+		})
+	}
+}
+
+func TestRemediationRejectsIncompatibleActionKind(t *testing.T) {
+	t.Parallel()
+	factory, _ := NewFactory(ClockFunc(time.Now), &sequenceIDs{})
+	session := "ses_1"
+	commit := strings.Repeat("a", 40)
+	packet := Remediation{
+		FindingID: "fnd_1", Kind: "choose_empty_commit", SessionID: &session,
+		Layer:    &RemediationLayer{MRIID: 7, CommitSHA: &commit},
+		Worktree: &SessionWorktree{Path: "/repo", GitState: "empty_commit"},
+		RequiredWork: &RequiredWork{
+			Kind: "choose_empty_commit_outcome", Options: []string{"drop_current", "keep_empty"},
+		},
+		EvidenceRefs: []string{},
+		Actions: []Action{
+			validSessionAction("continue_drop_current", session, "empty_commit_current"),
+			validSessionAction("continue_keep_empty", session, "empty_commit_current"),
+		},
+	}
+	if _, err := factory.NewRemediation(packet); err != nil {
+		t.Fatalf("valid compatibility rejected: %v", err)
+	}
+	packet.Actions[1] = validSessionAction("continue_restack", session, "empty_commit_current")
+	if _, err := factory.NewRemediation(packet); err == nil {
+		t.Fatal("choose_empty_commit accepted incompatible continue_restack action")
+	}
+}
+
+func TestActionRemoteAndWorktreeBindingsMustMatchEnvelope(t *testing.T) {
+	t.Parallel()
+	sessionID := "ses_1"
+	remote := Remote{Name: "origin"}
+	worktree := &SessionWorktree{Path: "/managed", GitState: "rebase_conflict"}
+	env := Envelope{
+		Session: &Session{SessionID: sessionID, Remote: remote, Worktree: worktree},
+		Findings: []Finding{
+			{FindingID: "fnd_1"},
+		},
+		Evidence: []Evidence{},
+		Remediations: []Remediation{{
+			RemediationID: "rem_1", FindingID: "fnd_1", Kind: "resolve_conflict",
+			SessionID: &sessionID, Worktree: worktree, EvidenceRefs: []string{},
+			Actions: []Action{
+				validSessionAction("continue_restack", sessionID, "conflicts_resolved_and_staged"),
+			},
+		}},
+		Data: map[string]any{},
+	}
+	env.Remediations[0].Actions[0].CWD = worktree.Path
+	if err := validateReferences(env); err != nil {
+		t.Fatalf("valid action context rejected: %v", err)
+	}
+	env.Remediations[0].Actions[0].Argv[5] = "attacker"
+	if err := validateReferences(env); err == nil {
+		t.Fatal("action remote that disagrees with session accepted")
+	}
+	env.Remediations[0].Actions[0].Argv[5] = remote.Name
+	env.Remediations[0].Actions[0].CWD = "/other"
+	if err := validateReferences(env); err == nil {
+		t.Fatal("action cwd that disagrees with managed worktree accepted")
 	}
 }
 

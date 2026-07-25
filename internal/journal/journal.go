@@ -81,6 +81,16 @@ func (j *Journal) initialize(ctx context.Context) error {
 			payload BLOB NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS observations_stack_time ON observations(stack_id, observed_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS finding_intervals (
+				finding_id TEXT PRIMARY KEY,
+				stack_id TEXT NOT NULL REFERENCES tracked_stacks(stack_id),
+				semantic_key TEXT NOT NULL,
+				first_seen_at TEXT NOT NULL,
+				last_seen_at TEXT NOT NULL,
+				resolved_at TEXT
+			)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS one_active_finding_interval
+			 ON finding_intervals(stack_id,semantic_key) WHERE resolved_at IS NULL`,
 		`CREATE TABLE IF NOT EXISTS sessions (
 			session_id TEXT PRIMARY KEY,
 			project_key TEXT NOT NULL,
@@ -159,6 +169,100 @@ type Observation struct {
 	SnapshotID    string
 	Disposition   string
 	Payload       json.RawMessage
+}
+
+// FindingCandidate identifies one semantic finding before it is published.
+// ProposedID is used only when no continuously-active interval exists.
+type FindingCandidate struct {
+	SemanticKey string
+	ProposedID  string
+}
+
+type FindingIdentity struct {
+	FindingID   string
+	FirstSeenAt string
+	LastSeenAt  string
+}
+
+// StabilizeFindings atomically reuses active finding identities, opens
+// intervals for new/recurring conditions, and closes conditions absent from
+// the current observation.
+func (j *Journal) StabilizeFindings(ctx context.Context, stackID, projectKey string,
+	candidates []FindingCandidate) ([]FindingIdentity, error) {
+	if stackID == "" || projectKey == "" {
+		return nil, errors.New("invalid finding stabilization")
+	}
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		if candidate.SemanticKey == "" || candidate.ProposedID == "" || seen[candidate.SemanticKey] {
+			return nil, errors.New("invalid finding candidate")
+		}
+		seen[candidate.SemanticKey] = true
+	}
+	now := j.clock().UTC().Format(time.RFC3339Nano)
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO tracked_stacks
+		(stack_id,project_key,created_at,last_seen_at) VALUES(?,?,?,?)
+		ON CONFLICT(stack_id) DO UPDATE SET last_seen_at=excluded.last_seen_at`,
+		stackID, projectKey, now, now); err != nil {
+		return nil, err
+	}
+	active := map[string]FindingIdentity{}
+	rows, err := tx.QueryContext(ctx, `SELECT semantic_key,finding_id,first_seen_at,last_seen_at
+		FROM finding_intervals WHERE stack_id=? AND resolved_at IS NULL`, stackID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var key string
+		var identity FindingIdentity
+		if err := rows.Scan(&key, &identity.FindingID, &identity.FirstSeenAt,
+			&identity.LastSeenAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		active[key] = identity
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	identities := make([]FindingIdentity, len(candidates))
+	for index, candidate := range candidates {
+		if identity, ok := active[candidate.SemanticKey]; ok {
+			identity.LastSeenAt = now
+			identities[index] = identity
+			if _, err := tx.ExecContext(ctx, `UPDATE finding_intervals SET last_seen_at=?
+				WHERE finding_id=? AND resolved_at IS NULL`, now, identity.FindingID); err != nil {
+				return nil, err
+			}
+			delete(active, candidate.SemanticKey)
+			continue
+		}
+		identity := FindingIdentity{
+			FindingID: candidate.ProposedID, FirstSeenAt: now, LastSeenAt: now,
+		}
+		identities[index] = identity
+		if _, err := tx.ExecContext(ctx, `INSERT INTO finding_intervals
+			(finding_id,stack_id,semantic_key,first_seen_at,last_seen_at,resolved_at)
+			VALUES(?,?,?,?,?,NULL)`, identity.FindingID, stackID, candidate.SemanticKey,
+			now, now); err != nil {
+			return nil, err
+		}
+	}
+	for _, identity := range active {
+		if _, err := tx.ExecContext(ctx, `UPDATE finding_intervals SET resolved_at=?
+			WHERE finding_id=? AND resolved_at IS NULL`, now, identity.FindingID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return identities, nil
 }
 
 func (j *Journal) RecordObservation(ctx context.Context, observation Observation) error {

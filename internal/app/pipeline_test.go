@@ -9,10 +9,132 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nkaewam/mrstack/internal/api"
 	"github.com/nkaewam/mrstack/internal/cli"
 	"github.com/nkaewam/mrstack/internal/gitlab"
 	"github.com/nkaewam/mrstack/internal/stack"
 )
+
+func TestAggregatePipelineFailureWithoutDirectJobsHasSafePacket(t *testing.T) {
+	handler := &Handler{Now: func() time.Time {
+		return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	}}
+	factory, err := handler.factory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	finding, err := factory.NewFinding("pipeline_failed", api.DispositionActionRequired,
+		api.FindingScope{Kind: "member", MRIID: intPtr(1), Position: intPtr(0), PipelineID: stringPtr("9")},
+		"aggregate pipeline failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kind, pipelineID, sourceSHA, webURL := "branch", "9", strings.Repeat("a", 40), "https://gitlab.example/pipelines/9"
+	env := api.Envelope{
+		Stack: &api.Stack{
+			Remote: api.Remote{Name: "origin"},
+			Members: []api.Member{{
+				Position: 0, IID: 1,
+				Pipeline: &api.Pipeline{
+					Currentness: "exact", Kind: &kind, ID: &pipelineID,
+					SourceSHA: &sourceSHA, WebURL: &webURL,
+					BlockingStatus: "failed", FailedJobs: []api.FailedJob{},
+				},
+			}},
+		},
+		Findings: []api.Finding{finding}, Evidence: []api.Evidence{},
+		Remediations: []api.Remediation{},
+	}
+	if err := handler.attachCheckPackets(&env, factory, "/repo"); err != nil {
+		t.Fatalf("aggregate failure became internal: %v", err)
+	}
+	if len(env.Remediations) != 1 || env.Remediations[0].Kind != "wait_and_recheck" ||
+		len(env.Remediations[0].Actions) != 1 ||
+		env.Remediations[0].Actions[0].Kind != "recheck" {
+		t.Fatalf("unsafe aggregate remediation: %+v", env.Remediations)
+	}
+}
+
+func intPtr(value int) *int          { return &value }
+func stringPtr(value string) *string { return &value }
+
+func TestCheckMergeabilityPrecedesReady(t *testing.T) {
+	tests := []struct {
+		name, status, disposition, code, remediation string
+		conflicts                                    bool
+	}{
+		{"conflict", "mergeable", "action_required", "merge_conflict", "human_handoff", true},
+		{"checking", "checking", "waiting", "mergeability_checking", "wait_and_recheck", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, _, mainOID, sourceOID, _ := createStackRepository(t)
+			mrs, err := json.Marshal([]map[string]any{{
+				"iid": 1, "state": "opened", "source_branch": "feature/one", "target_branch": "main",
+				"sha": sourceOID, "web_url": "https://gitlab.example/group/project/-/merge_requests/1",
+				"author": map[string]any{"id": 7, "username": "developer"},
+				"diff_refs": map[string]any{
+					"base_sha": mainOID, "head_sha": sourceOID, "start_sha": mainOID,
+				},
+				"detailed_merge_status": tt.status, "has_conflicts": tt.conflicts,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+			handler := &Handler{
+				Runner: fakeGlabRunner{responses: map[string]json.RawMessage{
+					"/version": json.RawMessage(`{"version":"18.11.2"}`),
+					"/projects/group%2Fproject": json.RawMessage(`{
+						"id":42,"path_with_namespace":"group/project",
+						"web_url":"https://gitlab.example/group/project","default_branch":"main",
+						"only_allow_merge_if_pipeline_succeeds":false
+					}`),
+					"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
+				}},
+				Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
+				Now: func() time.Time { return now },
+			}
+			result := runMachine(t, handler, "check", "feature/one")
+			if result.exit != 0 {
+				t.Fatalf("exit=%d output=%s", result.exit, result.stdout)
+			}
+			var envelope struct {
+				Disposition string `json:"disposition"`
+			}
+			if err := json.Unmarshal([]byte(result.stdout), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Disposition != tt.disposition {
+				t.Fatalf("disposition=%s want=%s\n%s", envelope.Disposition, tt.disposition, result.stdout)
+			}
+			assertActionPacket(t, result.stdout, tt.code, tt.remediation)
+			if tt.name == "conflict" {
+				var first struct {
+					Findings []api.Finding `json:"findings"`
+				}
+				if err := json.Unmarshal([]byte(result.stdout), &first); err != nil {
+					t.Fatal(err)
+				}
+				now = now.Add(5 * time.Minute)
+				repeated := runMachine(t, handler, "check", "feature/one")
+				var second struct {
+					Findings []api.Finding `json:"findings"`
+				}
+				if err := json.Unmarshal([]byte(repeated.stdout), &second); err != nil {
+					t.Fatal(err)
+				}
+				if repeated.exit != 0 || len(first.Findings) != 1 || len(second.Findings) != 1 ||
+					first.Findings[0].FindingID != second.Findings[0].FindingID ||
+					first.Findings[0].FirstSeenAt != second.Findings[0].FirstSeenAt ||
+					first.Findings[0].LastSeenAt == second.Findings[0].LastSeenAt {
+					t.Fatalf("active finding interval was not stable:\nfirst=%s\nsecond=%s",
+						result.stdout, repeated.stdout)
+				}
+			}
+		})
+	}
+}
 
 func TestClassifyPipelineKind(t *testing.T) {
 	tests := []struct {

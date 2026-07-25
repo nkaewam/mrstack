@@ -79,6 +79,60 @@ func TestRepeatedSnapshotUpdatesOnlyLastSeen(t *testing.T) {
 	}
 }
 
+func TestFindingIntervalsRemainStableThenMintOnRecurrence(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	j, err := Open(filepath.Join(t.TempDir(), "journal.db"), func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	ctx := context.Background()
+	first, err := j.StabilizeFindings(ctx, "stk_1", "host/project", []FindingCandidate{{
+		SemanticKey: "pipeline_failed/member/1", ProposedID: "fnd_first",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(5 * time.Minute)
+	repeated, err := j.StabilizeFindings(ctx, "stk_1", "host/project", []FindingCandidate{{
+		SemanticKey: "pipeline_failed/member/1", ProposedID: "fnd_unused",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated[0].FindingID != first[0].FindingID ||
+		repeated[0].FirstSeenAt != first[0].FirstSeenAt ||
+		repeated[0].LastSeenAt == first[0].LastSeenAt {
+		t.Fatalf("active interval was not preserved: first=%+v repeated=%+v", first, repeated)
+	}
+	now = now.Add(5 * time.Minute)
+	if _, err := j.StabilizeFindings(ctx, "stk_1", "host/project", nil); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(5 * time.Minute)
+	recurred, err := j.StabilizeFindings(ctx, "stk_1", "host/project", []FindingCandidate{{
+		SemanticKey: "pipeline_failed/member/1", ProposedID: "fnd_recurred",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recurred[0].FindingID == first[0].FindingID ||
+		recurred[0].FirstSeenAt == first[0].FirstSeenAt {
+		t.Fatalf("recurrence reused resolved identity: first=%+v recurred=%+v", first, recurred)
+	}
+	var active, resolved int
+	if err := j.db.QueryRowContext(ctx, `SELECT
+		sum(CASE WHEN resolved_at IS NULL THEN 1 ELSE 0 END),
+		sum(CASE WHEN resolved_at IS NOT NULL THEN 1 ELSE 0 END)
+		FROM finding_intervals WHERE stack_id='stk_1'`).Scan(&active, &resolved); err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 || resolved != 1 {
+		t.Fatalf("active=%d resolved=%d", active, resolved)
+	}
+}
+
 func TestOnlyOneActiveSessionPerProjectUnderConcurrency(t *testing.T) {
 	t.Parallel()
 	j := newTestJournal(t)

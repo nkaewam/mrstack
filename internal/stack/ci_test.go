@@ -22,6 +22,7 @@ func TestAssessCI_C01_C09_C12(t *testing.T) {
 		{"older green never counts C02", CIPolicyRequired, []Pipeline{{ID: 1, MRIID: 4, Kind: PipelineBranch, SourceSHA: "old", AssociatedWithMR: true, Status: "success"}}, FindingMissingRequiredPipeline, DispositionWaiting, false},
 		{"exact branch pipeline needs no MR association", CIPolicyRequired, []Pipeline{{ID: 1, MRIID: 4, Kind: PipelineBranch, SourceSHA: "source", Status: "success"}}, "", "", true},
 		{"failed C03", CIPolicyRequired, []Pipeline{{ID: 2, MRIID: 4, Kind: PipelineDetachedMR, SourceSHA: "source", AssociatedWithMR: true, Status: "failed", FailedJobIDs: []int64{9, 3}}}, FindingCIFailed, DispositionActionRequired, true},
+		{"skipped is a blocking failure", CIPolicyRequired, []Pipeline{{ID: 12, MRIID: 4, Kind: PipelineBranch, SourceSHA: "source", Status: "skipped"}}, FindingCIFailed, DispositionActionRequired, true},
 		{"exact detached pipeline needs no MR association", CIPolicyRequired, []Pipeline{{ID: 2, MRIID: 4, Kind: PipelineDetachedMR, SourceSHA: "source", Status: "success"}}, "", "", true},
 		{"unknown pipeline kind C05", CIPolicyRequired, []Pipeline{{ID: 2, MRIID: 4, Kind: PipelineUnknown, SourceSHA: "source", Status: "success"}}, FindingAmbiguousPipeline, DispositionHumanRequired, false},
 		{"merged result parents forward C04", CIPolicyRequired, []Pipeline{{ID: 3, MRIID: 4, Kind: PipelineMergedResult, SourceSHA: "source", AssociatedWithMR: true, SyntheticParents: []string{"source", "target"}, Status: "success"}}, "", "", true},
@@ -48,7 +49,8 @@ func TestAssessCI_C01_C09_C12(t *testing.T) {
 			if len(got.Findings) != 1 || got.Findings[0].Code != tt.code || got.Findings[0].Disposition != tt.disposition {
 				t.Fatalf("findings=%+v", got.Findings)
 			}
-			if tt.code == FindingCIFailed && !slices.Equal(got.Findings[0].FailedJobs, []int64{3, 9}) {
+			if tt.code == FindingCIFailed && len(tt.pipelines[0].FailedJobIDs) > 0 &&
+				!slices.Equal(got.Findings[0].FailedJobs, []int64{3, 9}) {
 				t.Fatalf("failed jobs not pinned deterministically: %v", got.Findings[0].FailedJobs)
 			}
 		})

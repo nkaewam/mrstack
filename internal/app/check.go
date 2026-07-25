@@ -151,6 +151,23 @@ func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (
 			return rc.repo.IsAncestor(ctx, ancestor, descendant)
 		})
 		allFindings = append(allFindings, alignment.Findings...)
+		for position, member := range discovered.Stack.Members {
+			raw := mrs[byIID[member.IID]]
+			switch {
+			case raw.HasConflicts:
+				allFindings = append(allFindings, stack.Finding{
+					Code: stack.FindingMergeConflict, Disposition: stack.DispositionActionRequired,
+					Message: "GitLab reports conflicts for the current source and target revisions",
+					MRIID:   member.IID, LayerIndex: position,
+				})
+			case raw.DetailedMergeStatus == "checking" || raw.DetailedMergeStatus == "unchecked":
+				allFindings = append(allFindings, stack.Finding{
+					Code: stack.FindingMergeabilityChecking, Disposition: stack.DispositionWaiting,
+					Message: "GitLab mergeability is still being computed",
+					MRIID:   member.IID, LayerIndex: position,
+				})
+			}
+		}
 	}
 
 	pipelines := make([]stack.Pipeline, 0, len(discovered.Stack.Members))
@@ -204,7 +221,7 @@ func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (
 				}
 			}
 		}
-		if p.Status == "failed" || p.Status == "canceled" {
+		if p.Status == "failed" || p.Status == "canceled" || p.Status == "skipped" {
 			jobs, jobsErr := rc.client.PipelineJobs(ctx, rc.project.ID.String(), head.ID.String())
 			if jobsErr != nil {
 				return cli.Result{}, classifyGlab("read failed pipeline jobs", jobsErr)
@@ -286,6 +303,12 @@ func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (
 	} else {
 		env.ApplyFindingDisposition()
 	}
+	if persist {
+		if err := h.stabilizeCheckFindings(ctx, rc, &env); err != nil {
+			return cli.Result{}, cli.Unavailable("journal_unavailable",
+				"cannot stabilize stack finding identities", false)
+		}
+	}
 	if err := h.attachCheckPackets(&env, factory, rc.repo.Dir); err != nil {
 		return cli.Result{}, cli.Internal("cannot create check remediation packets", err)
 	}
@@ -298,6 +321,45 @@ func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (
 		}
 	}
 	return result(env, human)
+}
+
+func (h *Handler) stabilizeCheckFindings(ctx context.Context, rc repositoryContext,
+	env *api.Envelope) error {
+	if env.Stack == nil {
+		return nil
+	}
+	j, err := h.openJournal(rc.repo.Dir)
+	if err != nil {
+		return err
+	}
+	defer j.Close()
+	candidates := make([]journal.FindingCandidate, len(env.Findings))
+	for index := range env.Findings {
+		finding := &env.Findings[index]
+		candidates[index] = journal.FindingCandidate{
+			SemanticKey: stableID("fkey", struct {
+				Code  string
+				Scope api.FindingScope
+			}{finding.Code, finding.Scope}),
+			ProposedID: stableID("fnd", struct {
+				StackID string
+				Code    string
+				Scope   api.FindingScope
+				SeenAt  string
+			}{env.Stack.StackID, finding.Code, finding.Scope, finding.FirstSeenAt}),
+		}
+	}
+	identities, err := j.StabilizeFindings(ctx, env.Stack.StackID,
+		rc.fetch.Host+"/"+rc.fetch.Project, candidates)
+	if err != nil {
+		return err
+	}
+	for index, identity := range identities {
+		env.Findings[index].FindingID = identity.FindingID
+		env.Findings[index].FirstSeenAt = identity.FirstSeenAt
+		env.Findings[index].LastSeenAt = identity.LastSeenAt
+	}
+	return nil
 }
 
 func snapshotID(value api.Stack) string {
@@ -548,6 +610,8 @@ func convertFinding(factory *api.Factory, in stack.Finding) (api.Finding, error)
 		stack.FindingCIPolicyUnknown:            "ci_policy_unknown",
 		stack.FindingPipelineStatusUnknown:      "pipeline_status_unknown",
 		stack.FindingPipelineRunning:            "pipeline_running",
+		stack.FindingMergeConflict:              "merge_conflict",
+		stack.FindingMergeabilityChecking:       "mergeability_checking",
 	}[in.Code]
 	disposition := api.Disposition(in.Disposition)
 	scope := api.FindingScope{Kind: "stack"}

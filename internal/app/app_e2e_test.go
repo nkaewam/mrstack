@@ -396,6 +396,81 @@ func TestRestackConflictContinueRequiresResolvedAndExplicitlyStagedWork(t *testi
 	assertPublishedSchema(t, completed.stdout)
 }
 
+func TestRestackCrashBoundariesRemainRecoverableAndAbortable(t *testing.T) {
+	for _, boundary := range []string{
+		"after_session_begin", "after_worktree_prepare", "after_replay_checkpoint",
+	} {
+		t.Run(boundary, func(t *testing.T) {
+			handler, snapshotID := pausedSessionFixture(t, "conflict")
+			handler.Failpoint = func(name string) error {
+				if name == boundary {
+					return errors.New("simulated process death")
+				}
+				return nil
+			}
+			interrupted := runMachine(t, handler, "--yes", "restack", "--snapshot", snapshotID)
+			if interrupted.exit != 3 {
+				t.Fatalf("boundary %s did not interrupt after durable checkpoint: %s",
+					boundary, interrupted.stdout)
+			}
+			j, err := handler.openJournal(handler.Dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored, err := j.ActiveSession(context.Background(), "gitlab.example/group/project")
+			_ = j.Close()
+			if err != nil {
+				t.Fatalf("durable session missing after %s: %v", boundary, err)
+			}
+			handler.Failpoint = nil
+			recovered := runMachine(t, handler, "restack", "recover", "--session", stored.ID)
+			if recovered.exit != 0 {
+				t.Fatalf("read-only recovery rejected %s session: %s", stored.State, recovered.stdout)
+			}
+			continued := runMachine(t, handler, "--yes", "restack", "continue", "--session", stored.ID)
+			session := decodeSession(t, continued.stdout)
+			if continued.exit != 0 || session.State != "rebase_conflict" || session.Worktree == nil {
+				t.Fatalf("boundary %s did not restart exact replay: exit=%d output=%s",
+					boundary, continued.exit, continued.stdout)
+			}
+			aborted := runMachine(t, handler, "--yes", "restack", "abort", "--session", stored.ID)
+			if aborted.exit != 0 || decodeSession(t, aborted.stdout).State != "aborted" {
+				t.Fatalf("boundary %s did not abort cleanly: %s", boundary, aborted.stdout)
+			}
+			if _, err := os.Stat(session.Worktree.Path); !os.IsNotExist(err) {
+				t.Fatalf("managed worktree survived abort at %s: err=%v", boundary, err)
+			}
+		})
+	}
+}
+
+func TestRestackAbortCleansPreWorktreeCrashCheckpoint(t *testing.T) {
+	handler, snapshotID := pausedSessionFixture(t, "conflict")
+	handler.Failpoint = func(name string) error {
+		if name == "after_session_begin" {
+			return errors.New("simulated process death")
+		}
+		return nil
+	}
+	if interrupted := runMachine(t, handler, "--yes", "restack", "--snapshot", snapshotID); interrupted.exit != 3 {
+		t.Fatalf("expected durable preparation interruption: %s", interrupted.stdout)
+	}
+	j, err := handler.openJournal(handler.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := j.ActiveSession(context.Background(), "gitlab.example/group/project")
+	_ = j.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.Failpoint = nil
+	aborted := runMachine(t, handler, "--yes", "restack", "abort", "--session", stored.ID)
+	if aborted.exit != 0 || decodeSession(t, aborted.stdout).State != "aborted" {
+		t.Fatalf("pre-worktree checkpoint was not abortable: %s", aborted.stdout)
+	}
+}
+
 func TestRestackEmptyCommitRequiresExplicitDropOrKeep(t *testing.T) {
 	for _, choice := range []string{"--drop-current", "--keep-empty"} {
 		t.Run(strings.TrimPrefix(choice, "--"), func(t *testing.T) {
@@ -1036,6 +1111,7 @@ func TestLegacySquashAdvancementRetargetFailureIsDurableAndRetryOnly(t *testing.
 	}
 	var calls [][]string
 	targetAttempts := 0
+	targetApplied := false
 	dynamic := func(endpoint string, args []string) (gitexec.Result, error) {
 		if endpoint != "/projects/42/merge_requests/2" {
 			return gitexec.Result{}, nil
@@ -1047,8 +1123,11 @@ func TestLegacySquashAdvancementRetargetFailureIsDurableAndRetryOnly(t *testing.
 		if isPUT {
 			targetAttempts++
 			if targetAttempts == 1 {
-				return gitexec.Result{Stderr: []byte("temporary target failure")},
-					&gitexec.CommandError{Name: "glab", ExitCode: 1, Stderr: "temporary target failure"}
+				// Simulate the provider applying the mutation before the client
+				// loses the response/crashes.
+				targetApplied = true
+				return gitexec.Result{Stderr: []byte("response lost after apply")},
+					&gitexec.CommandError{Name: "glab", ExitCode: 1, Stderr: "response lost after apply"}
 			}
 			return gitexec.Result{Stdout: []byte(`{"iid":2}`)}, nil
 		}
@@ -1056,7 +1135,12 @@ func TestLegacySquashAdvancementRetargetFailureIsDurableAndRetryOnly(t *testing.
 			"refs/heads/feature/successor"))[0]
 		body, marshalErr := json.Marshal(map[string]any{
 			"iid": 2, "state": "opened", "source_branch": "feature/successor",
-			"target_branch": "feature/merged", "sha": current,
+			"target_branch": func() string {
+				if targetApplied {
+					return "main"
+				}
+				return "feature/merged"
+			}(), "sha": current,
 		})
 		return gitexec.Result{Stdout: body}, marshalErr
 	}
@@ -1112,7 +1196,7 @@ func TestLegacySquashAdvancementRetargetFailureIsDurableAndRetryOnly(t *testing.
 	pushesBefore := countAtomicPushes(calls)
 	continued := runMachine(t, handler, "--yes", "restack", "continue", "--session", startSession.ID)
 	if continued.exit != 0 || decodeSession(t, continued.stdout).State != "completed" ||
-		targetAttempts != 2 {
+		targetAttempts != 1 {
 		t.Fatalf("target retry failed: exit=%d attempts=%d output=%s",
 			continued.exit, targetAttempts, continued.stdout)
 	}

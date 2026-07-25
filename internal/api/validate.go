@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/nkaewam/mrstack/internal/cli"
 )
 
 var (
@@ -182,6 +184,10 @@ func validateReferences(e Envelope) error {
 			}
 		}
 		for _, action := range item.Actions {
+			inv, err := actionInvocation(action)
+			if err != nil {
+				return err
+			}
 			if action.Requires.SnapshotID != nil &&
 				(e.Stack == nil || *action.Requires.SnapshotID != e.Stack.SnapshotID) {
 				return fmt.Errorf("api: action %q snapshot binding disagrees with stack", action.Kind)
@@ -192,6 +198,31 @@ func validateReferences(e Envelope) error {
 			}
 			if action.Requires.PlanID != nil && !envelopeHasPlanID(e, *action.Requires.PlanID) {
 				return fmt.Errorf("api: action %q plan binding disagrees with envelope", action.Kind)
+			}
+			if e.Stack != nil && inv.Globals.Remote != e.Stack.Remote.Name {
+				return fmt.Errorf("api: action %q remote binding disagrees with stack", action.Kind)
+			}
+			if item.SessionID != nil &&
+				(e.Session == nil || inv.Globals.Remote != e.Session.Remote.Name) {
+				return fmt.Errorf("api: action %q remote binding disagrees with remediation session", action.Kind)
+			}
+			if action.Requires.SessionID != nil {
+				if e.Session == nil || inv.Globals.Remote != e.Session.Remote.Name {
+					return fmt.Errorf("api: action %q remote binding disagrees with session", action.Kind)
+				}
+				expectedCWD := "/"
+				if e.Session.Worktree != nil {
+					expectedCWD = e.Session.Worktree.Path
+				}
+				if action.CWD != expectedCWD {
+					return fmt.Errorf("api: action %q cwd binding disagrees with session worktree", action.Kind)
+				}
+			}
+			if action.Requires.PlanID != nil {
+				plan, ok := e.Data["plan"].(Plan)
+				if ok && inv.Globals.Remote != plan.Remote.Name {
+					return fmt.Errorf("api: action %q remote binding disagrees with plan", action.Kind)
+				}
 			}
 		}
 	}
@@ -375,21 +406,46 @@ func validateRemediation(r Remediation) error {
 			return err
 		}
 	}
+	actionKinds := make(map[string]int, len(r.Actions))
+	for _, action := range r.Actions {
+		actionKinds[action.Kind]++
+	}
+	actionsOnly := func(kinds ...string) bool {
+		allowed := make(map[string]bool, len(kinds))
+		for _, kind := range kinds {
+			allowed[kind] = true
+		}
+		for kind, count := range actionKinds {
+			if !allowed[kind] || count != 1 {
+				return false
+			}
+		}
+		return true
+	}
+	hasAction := func(kind string) bool { return actionKinds[kind] == 1 }
 	switch r.Kind {
 	case "restack":
 		if r.SnapshotID == nil || r.Layer == nil || r.Layer.BoundarySHA == nil ||
-			len(r.Actions) == 0 {
+			r.Member == nil || len(r.Actions) != 1 ||
+			!actionsOnly("start_restack", "start_planned_restack") {
 			return errors.New("api: restack remediation requires snapshot, exact layer, and action")
+		}
+		if r.PlanID == nil && !hasAction("start_restack") ||
+			r.PlanID != nil && !hasAction("start_planned_restack") {
+			return errors.New("api: restack remediation action disagrees with plan binding")
 		}
 	case "resolve_conflict":
 		if r.SessionID == nil || r.Worktree == nil || r.RequiredWork == nil ||
-			r.RequiredWork.Kind != "resolve_and_stage_conflicts" || len(r.Actions) == 0 {
+			r.RequiredWork.Kind != "resolve_and_stage_conflicts" ||
+			!actionsOnly("continue_restack", "abort_restack") || !hasAction("continue_restack") {
 			return errors.New("api: resolve_conflict remediation lacks bound conflict work")
 		}
 	case "choose_empty_commit":
 		if r.SessionID == nil || r.Layer == nil || r.Layer.CommitSHA == nil ||
+			r.Worktree == nil ||
 			r.RequiredWork == nil || r.RequiredWork.Kind != "choose_empty_commit_outcome" ||
-			len(r.Actions) < 2 {
+			!actionsOnly("continue_drop_current", "continue_keep_empty", "abort_restack") ||
+			!hasAction("continue_drop_current") || !hasAction("continue_keep_empty") {
 			return errors.New("api: choose_empty_commit remediation lacks bound commit choices")
 		}
 	case "authorize_signature_loss":
@@ -397,15 +453,30 @@ func validateRemediation(r Remediation) error {
 			return errors.New("api: signature-loss remediation requires snapshot and no executable action")
 		}
 	case "inspect_ci_failure":
-		if r.RequiredWork == nil || r.RequiredWork.Kind != "repair_ci_failure" || len(r.Actions) == 0 {
+		if r.RequiredWork == nil || r.RequiredWork.Kind != "repair_ci_failure" ||
+			!actionsOnly("fetch_ci_logs", "recheck") || !hasAction("fetch_ci_logs") {
 			return errors.New("api: CI remediation lacks pinned repair work")
 		}
-	case "recover_publication", "retry_retarget":
-		if r.SessionID == nil || len(r.Actions) == 0 {
-			return fmt.Errorf("api: %s remediation requires session and action", r.Kind)
+		for _, action := range r.Actions {
+			if action.Kind == "fetch_ci_logs" &&
+				(*action.Requires.PipelineID != r.RequiredWork.PipelineID ||
+					!equalStrings(action.Requires.JobIDs, r.RequiredWork.JobIDs)) {
+				return errors.New("api: CI remediation action disagrees with required work")
+			}
+		}
+	case "recover_publication":
+		if r.SessionID == nil || len(r.Actions) == 0 ||
+			!actionsOnly("recover_restack", "continue_restack", "abort_restack") ||
+			!hasAction("recover_restack") && !hasAction("continue_restack") {
+			return errors.New("api: recover_publication remediation requires a recovery action")
+		}
+	case "retry_retarget":
+		if r.SessionID == nil || len(r.Actions) != 1 ||
+			!actionsOnly("continue_restack") || !hasAction("continue_restack") {
+			return errors.New("api: retry_retarget remediation requires a continue action")
 		}
 	case "wait_and_recheck":
-		if len(r.Actions) == 0 {
+		if len(r.Actions) != 1 || !actionsOnly("recheck") || !hasAction("recheck") {
 			return errors.New("api: wait remediation requires recheck action")
 		}
 	case "refresh_local_checkout":
@@ -419,6 +490,23 @@ func validateRemediation(r Remediation) error {
 		}
 	default:
 		return fmt.Errorf("api: unknown remediation kind %q", r.Kind)
+	}
+	for _, action := range r.Actions {
+		if r.SnapshotID != nil && action.Requires.SnapshotID != nil &&
+			*action.Requires.SnapshotID != *r.SnapshotID {
+			return fmt.Errorf("api: remediation/action snapshot bindings disagree")
+		}
+		if r.SessionID != nil && action.Requires.SessionID != nil &&
+			*action.Requires.SessionID != *r.SessionID {
+			return fmt.Errorf("api: remediation/action session bindings disagree")
+		}
+		if r.PlanID != nil && action.Requires.PlanID != nil &&
+			*action.Requires.PlanID != *r.PlanID {
+			return fmt.Errorf("api: remediation/action plan bindings disagree")
+		}
+		if r.Worktree != nil && action.Requires.SessionID != nil && action.CWD != r.Worktree.Path {
+			return fmt.Errorf("api: remediation/action worktree bindings disagree")
+		}
 	}
 	return nil
 }
@@ -472,6 +560,26 @@ func validateRequiredWork(work RequiredWork) error {
 func validateAction(a Action) error {
 	if len(a.Argv) == 0 || a.Argv[0] == "" || !strings.HasPrefix(a.CWD, "/") || a.Preconditions == nil || a.Requires.JobIDs == nil {
 		return fmt.Errorf("api: action %q requires argv, absolute cwd, preconditions, and job_ids", a.Kind)
+	}
+	for name, value := range map[string]*string{
+		"snapshot_id": a.Requires.SnapshotID,
+		"session_id":  a.Requires.SessionID,
+		"plan_id":     a.Requires.PlanID,
+		"pipeline_id": a.Requires.PipelineID,
+	} {
+		if value != nil && strings.TrimSpace(*value) == "" {
+			return fmt.Errorf("api: action %q has empty required %s", a.Kind, name)
+		}
+	}
+	seenJobIDs := map[string]bool{}
+	for _, jobID := range a.Requires.JobIDs {
+		if !validDecimal(jobID) || seenJobIDs[jobID] {
+			return fmt.Errorf("api: action %q has invalid or duplicate required job ID", a.Kind)
+		}
+		seenJobIDs[jobID] = true
+	}
+	if a.Requires.PipelineID != nil && !validDecimal(*a.Requires.PipelineID) {
+		return fmt.Errorf("api: action %q has invalid required pipeline ID", a.Kind)
 	}
 	contains := func(value string) bool {
 		for _, item := range a.Preconditions {
@@ -537,7 +645,91 @@ func validateAction(a Action) error {
 		}
 		seen[precondition] = true
 	}
-	return nil
+	_, err := actionInvocation(a)
+	return err
+}
+
+func actionInvocation(a Action) (cli.Invocation, error) {
+	var zero cli.Invocation
+	if len(a.Argv) == 0 || a.Argv[0] != "mrstack" {
+		return zero, fmt.Errorf("api: action %q executable must be mrstack", a.Kind)
+	}
+	for _, arg := range a.Argv[1:] {
+		if arg == "--gitlab-mode" || strings.HasPrefix(arg, "--gitlab-mode=") {
+			return zero, fmt.Errorf("api: action %q cannot override gitlab mode", a.Kind)
+		}
+		if arg == "--max-bytes" || strings.HasPrefix(arg, "--max-bytes=") {
+			return zero, fmt.Errorf("api: action %q cannot override the CI log budget", a.Kind)
+		}
+	}
+	inv, err := cli.Parse(a.Argv[1:])
+	if err != nil {
+		return zero, fmt.Errorf("api: action %q has invalid argv: %w", a.Kind, err)
+	}
+	if !inv.Machine() || strings.TrimSpace(inv.Globals.Remote) == "" {
+		return zero, fmt.Errorf("api: action %q requires machine mode and a bound remote", a.Kind)
+	}
+	if inv.Globals.Yes != a.Mutates {
+		return zero, fmt.Errorf("api: action %q confirmation argv disagrees with mutation", a.Kind)
+	}
+	equalJobs := func() bool { return equalStrings(inv.JobIDs, a.Requires.JobIDs) }
+	switch a.Kind {
+	case "start_restack":
+		if inv.Name != cli.CommandRestackStart || inv.SnapshotID != deref(a.Requires.SnapshotID) ||
+			inv.PlanID != "" || inv.Selector.Value != "" || inv.AllowSignatureLoss {
+			return zero, errors.New("api: start_restack argv disagrees with required snapshot")
+		}
+	case "start_planned_restack":
+		if inv.Name != cli.CommandRestackStart || inv.PlanID != deref(a.Requires.PlanID) ||
+			inv.SnapshotID != "" || inv.Selector.Value != "" || inv.AllowSignatureLoss {
+			return zero, errors.New("api: start_planned_restack argv disagrees with required plan")
+		}
+	case "continue_restack", "continue_drop_current", "continue_keep_empty":
+		wantDrop := a.Kind == "continue_drop_current"
+		wantKeep := a.Kind == "continue_keep_empty"
+		if inv.Name != cli.CommandRestackContinue || inv.SessionID != deref(a.Requires.SessionID) ||
+			inv.DropCurrent != wantDrop || inv.KeepEmpty != wantKeep {
+			return zero, fmt.Errorf("api: %s argv disagrees with required session transition", a.Kind)
+		}
+	case "abort_restack":
+		if inv.Name != cli.CommandRestackAbort || inv.SessionID != deref(a.Requires.SessionID) {
+			return zero, errors.New("api: abort_restack argv disagrees with required session")
+		}
+	case "recover_restack":
+		if inv.Name != cli.CommandRestackRecover || inv.SessionID != deref(a.Requires.SessionID) {
+			return zero, errors.New("api: recover_restack argv disagrees with required session")
+		}
+	case "fetch_ci_logs":
+		if inv.Name != cli.CommandCILogs || inv.PipelineID != deref(a.Requires.PipelineID) || !equalJobs() {
+			return zero, errors.New("api: fetch_ci_logs argv disagrees with required pipeline/jobs")
+		}
+	case "recheck":
+		if inv.Name != cli.CommandCheck || inv.Selector.Value != "" || inv.Selector.StackID != "" {
+			return zero, errors.New("api: recheck argv must perform an unselected repository check")
+		}
+	default:
+		return zero, fmt.Errorf("api: unknown action kind %q", a.Kind)
+	}
+	return inv, nil
+}
+
+func deref(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func validateOutcome(o Outcome) error {

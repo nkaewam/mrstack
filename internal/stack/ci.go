@@ -83,9 +83,9 @@ func AssessCI(member MergeRequest, policy CIPolicy, pipelines []Pipeline) CIAsse
 	result.Applicable = true
 	result.PipelineID = pipeline.ID
 	switch pipeline.Status {
-	case "success", "skipped":
+	case "success":
 		return result
-	case "failed", "canceled":
+	case "failed", "canceled", "skipped":
 		jobs := append([]int64(nil), pipeline.FailedJobIDs...)
 		sort.Slice(jobs, func(i, j int) bool { return jobs[i] < jobs[j] })
 		f := finding(FindingCIFailed, DispositionActionRequired, "exact-current pipeline failed", member.IID)

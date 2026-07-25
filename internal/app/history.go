@@ -270,7 +270,8 @@ func convertHistoryPage(page journal.HistoryPage) (api.HistoryData, error) {
 			if _, exists := intervals[finding.FindingID]; !exists {
 				intervals[finding.FindingID] = api.FindingInterval{
 					FindingID: finding.FindingID, Code: finding.Code,
-					FirstSeenAt: finding.FirstSeenAt, LastSeenAt: finding.LastSeenAt,
+					FirstSeenAt: finding.FirstSeenAt,
+					LastSeenAt:  record.LastSeenAt.UTC().Format(time.RFC3339Nano),
 				}
 			}
 		}
