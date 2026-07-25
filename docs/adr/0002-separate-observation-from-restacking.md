@@ -1,0 +1,5 @@
+# Separate observation from restacking
+
+Stack observation commands will be externally read-only and return structured findings, while history rewriting, retargeting, and pushing will occur only through explicit restack operations. Checks use GitLab mergeability and fetched Git ancestry but do not speculatively replay every layer; the explicit restack is where real rebase conflicts are encountered and preserved for resolution. This keeps continuous monitoring safe and predictable: the CLI owns deterministic Git mechanics and verifies structural invariants, while the coding agent owns semantic conflict resolution and repository-specific local validation and GitLab CI remains the readiness gate. No watcher mutates branches merely because it detects drift, and the CLI never merges an MR.
+
+A GitLab conflict result bound to the current source and target revisions becomes `action_required/merge_conflict`. A mergeability value that is still calculating, stale, or unknown becomes `waiting/mergeability_checking`; `check` never upgrades an unknown provider result into a claim that replay will be conflict-free.

@@ -1,0 +1,5 @@
+# Preserve layers across merge strategies
+
+Restacking will support both squash and ordinary predecessor merges by preserving each successor's layer rather than assuming the predecessor's commits appear unchanged on the base branch. After an externally initiated merge, the CLI uses the exact layer boundary required by ADR-0016 and replays only the successor's own commits onto the predecessor's former target, preventing squash-merged predecessor changes from reappearing in the successor MR.
+
+All boundary and layer commit objects must be available locally after fetching the selected project remote and GitLab's MR refs. A missing open source branch is invalid. A missing open target branch is also invalid unless it names the source branch of the unique, integration-proven legacy merged predecessor and GitLab MR/diff refs or bound journal evidence provide the exact historical target head. If that predecessor's exact historical objects are no longer retrievable, the operation returns `human_required/missing_layer_objects`. It never substitutes merge-base or patch-equivalence inference.

@@ -1,0 +1,5 @@
+# Bind mutations to a remote snapshot
+
+Every restack, retarget, and push will be guarded by the complete mutation-relevant topology captured at session start: GitLab host and project identity; selected remote name and credential-free canonical fetch/push project identities; default branch name and exact tip revision; and every participating MR's IID, state, source branch, target branch, author, exact remote source revision, and exact resolved target revision. The topology and remote identity are revalidated before replay, immediately before push, and again before any post-push target update.
+
+In `--no-input` mode, an agent must supply the exact `snapshot_id` returned by its preceding check plus an explicit `--yes`; there is no persistent auto-confirm setting. Any change to the captured topology or participating revisions invalidates the operation and returns `action_required/remote_changed`, preferring a fresh check and restack over overwriting concurrent work or implicitly reconciling a retargeted, closed, reassigned, or otherwise changed MR.

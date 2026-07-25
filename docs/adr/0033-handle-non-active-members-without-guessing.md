@@ -1,0 +1,5 @@
+# Handle non-active members without guessing
+
+An open MR whose source branch is missing returns `invalid/missing_active_branch`. An absent target branch has the same result unless it is the source branch of the unique, integration-proven legacy merged predecessor and the successor's exact historical target head is recoverable from GitLab MR/diff refs or bound journal evidence. A member that is closed without merging returns `human_required/closed_member`; `mrstack` preserves its relationship in the observation but neither skips it nor rewrites successors around it. Reopening the MR or manually restructuring GitLab relationships is required.
+
+A merged front may be followed in legacy mode only under ADR-0001's unique merged-predecessor rule. A merge above an open predecessor is the out-of-order violation in ADR-0032. A chain is `complete` only under ADR-0013's GitLab-confirmed historical rule. These states are exhaustive: branch absence, closure, merge, or lack of an open MR never causes the journal to invent or silently remove a member.

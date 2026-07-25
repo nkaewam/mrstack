@@ -1,0 +1,5 @@
+# Derive stacks from GitLab relationships
+
+GitLab is the sole source of truth for stack membership and order: each merge request's target branch identifies its predecessor through that predecessor's source branch. The CLI will derive stacks from these relationships instead of maintaining a separate manifest, avoiding duplicated state and allowing any clone or agent with GitLab access to reconstruct the same stack; malformed, ambiguous, or cyclic relationships will be reported rather than reconciled from local state.
+
+On GitLab versions that do not automatically retarget a successor after its front merges, `mrstack` may follow a merged predecessor only when exactly one GitLab MR has the target branch as its source branch and satisfies ADR-0034's GitLab integration proof. If no merged MR or multiple merged MRs qualify, the stack returns `human_required/ambiguous_merged_predecessor`. Journal history and branch-name conventions may supply evidence to the user, but never resolve the relationship.

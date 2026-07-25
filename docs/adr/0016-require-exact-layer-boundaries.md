@@ -1,0 +1,7 @@
+# Require exact layer boundaries
+
+Restacking will replay a layer only when its boundary is exactly supported by a journaled snapshot or GitLab MR diff-version history. If neither source yields a usable boundary, the CLI returns `human_required/ambiguous_layer_boundary` without changing refs; it will not guess from a merge base or patch equivalence, trading reduced automation for protection against silently duplicating or dropping predecessor changes.
+
+Evidence is usable only when it binds the captured MR head and its claimed boundary is an available ancestor of that head. If independently valid journal and GitLab records disagree for the same captured head, neither is preferred: the result is `human_required/conflicting_layer_boundary`. A layer containing a merge commit returns `human_required/merge_commit_in_layer`, and an otherwise valid boundary with no layer commits returns `human_required/empty_layer`.
+
+An explicit one-session boundary override uses a mandatory two-step flow. Read-only `restack plan --snapshot <id> --layer-boundary <mr>=<sha>` validates ancestry and returns the exact commits and affected branches plus a `plan_id` bound to the supplied snapshot and override. Only a later confirmed `restack --plan <id>` may create the session. The plan is invalidated by any snapshot change, and the override and resulting decision are journaled without becoming stack metadata.

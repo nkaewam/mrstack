@@ -1,0 +1,11 @@
+# Gate readiness on the whole stack's CI
+
+The stack reaches `ready` only when the relevant pipeline for every active merge request has passed. A relevant branch or detached-MR pipeline must use that MR's exact captured source-head revision. A merged-results pipeline may instead use GitLab's synthetic merge commit, but only when GitLab's pipeline association binds it to both the snapshot's exact source-head and target revisions. If that association cannot establish currentness, the MR returns `human_required/ambiguous_pipeline`; an older green result or matching branch name never counts.
+
+The implementable merged-results proof is: the pipeline is returned by GitLab's MR-pipelines endpoint for that IID, has merge-request source, and its fetched temporary commit has exactly the captured source and target revisions as its two parents. Parent order is deliberately ignored. If the server does not expose or allow fetching enough evidence, currentness remains ambiguous.
+
+Running or required-but-missing pipelines produce `waiting`, blocking manual jobs produce `human_required`, projects with no required pipeline treat CI as not applicable, and a failure anywhere produces `action_required`, deliberately preventing a `ready` result so the coding agent can address downstream regressions before the stack changes again.
+
+For a relevant pipeline, `mrstack` follows GitLab's aggregate blocking status rather than recursively inventing a second job scheduler. Failed `allow_failure` jobs do not block, and child or downstream pipelines matter only when GitLab propagates them into the parent pipeline's status. Absence is `waiting/missing_required_pipeline` only when the project's observable merge policy requires a successful pipeline; otherwise CI is explicitly reported as not applicable.
+
+CI is not declared not-applicable when requiredness cannot be observed with the authenticated user's permissions. That case is `human_required/ci_policy_unknown`. A canceled or skipped pipeline that GitLab still treats as blocking is `action_required/pipeline_failed`; a nonblocking manual job produces no finding, while a blocking manual job is `human_required/blocking_manual_job`. If an exact pipeline has an aggregate status that the normalized v1 model cannot classify, it is `human_required/pipeline_status_unknown`.

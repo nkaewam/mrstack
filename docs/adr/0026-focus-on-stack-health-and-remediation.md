@@ -1,0 +1,3 @@
+# Focus on stack health and remediation
+
+`mrstack` is a restack-centered health and remediation tool: it discovers and journals the active chain, checks alignment, conflicts, and current-head CI across the stack, exposes bounded failure evidence to a coding agent, and provides safe restack, continue, abort, and post-merge retarget operations. CLI-managed worktrees exist only for active restack conflicts; ordinary CI fixes occur in the external agent's own workspace and are propagated afterward by restacking. The tool does not merge MRs, manage approvals, author or reorder MRs, or own a daemon; the coding agent drives repeated one-shot checks and resolves semantic failures while the user or GitLab retains review and merge authority.

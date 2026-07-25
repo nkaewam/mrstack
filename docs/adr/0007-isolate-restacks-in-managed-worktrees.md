@@ -1,0 +1,7 @@
+# Isolate restacks in managed worktrees
+
+Each project will have at most one resumable restack session in a CLI-managed worktree, so rebases and conflict resolution never disturb the user's current checkout. On conflict the CLI preserves the worktree and reports its exact path and Git state for the coding agent to edit and explicitly stage only intended resolutions; `mrstack restack continue` stages nothing, validates the index, and advances the rebase non-interactively.
+
+Before creating a session, `mrstack` inspects every affected local branch ref and every registered worktree in the current repository's common Git directory. Staged, unstaged, or untracked changes in a worktree on an affected branch, or commits on any affected local branch ref that are not represented by the captured remote branch, stop preflight with `human_required/local_work_present`. V1 provides no bypass: the caller must commit and push, stash, or move that work before the remote history may be rewritten. Other clones cannot be inspected; snapshot validation and force-with-lease protect against their remote writes.
+
+After a successful push, `mrstack` may fast-update an affected local branch ref only when that branch is not checked out anywhere and the ref still equals the captured snapshot; checked-out or locally moved branches remain untouched and produce `local_checkout_stale` with their old and new revisions. The CLI then records the outcome and removes the managed worktree.
