@@ -307,10 +307,6 @@ type Session struct {
 	UpdatedAt  time.Time
 }
 
-var terminalStates = map[string]bool{
-	"completed": true, "aborted": true, "invalidated": true, "abandoned": true,
-}
-
 func validState(state string) bool {
 	switch state {
 	case "preparing", "replaying", "rebase_conflict", "empty_commit",

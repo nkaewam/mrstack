@@ -73,8 +73,8 @@ func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (
 		return completion, completionErr
 	}
 
-	selector := stack.Selector{}
-	selectorAPI := api.Selector{}
+	var selector stack.Selector
+	var selectorAPI api.Selector
 	switch {
 	case inv.Selector.Value == "":
 		branch, branchErr := rc.repo.CurrentBranch(ctx)

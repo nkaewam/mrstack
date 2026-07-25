@@ -18,9 +18,13 @@ const (
 	APIVersion = "mrstack/v1"
 )
 
-// Version is overridden by the release main package from linker-injected
-// metadata. It remains "dev" for local builds and tests.
-var Version = "dev"
+// Version, Commit, and BuildTime are overridden by the release main package
+// from linker-injected metadata.
+var (
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildTime = "unknown"
+)
 
 // Handler performs an already parsed invocation.
 type Handler interface {
@@ -98,7 +102,8 @@ func RunWithHandler(args []string, stdout, stderr io.Writer, handler Handler) in
 		return 0
 	}
 	if inv.ShowVersion {
-		_, _ = fmt.Fprintf(stdout, "mrstack %s\n", Version)
+		_, _ = fmt.Fprintf(stdout, "mrstack %s (commit %s, built %s)\n",
+			Version, Commit, BuildTime)
 		return 0
 	}
 	if handler == nil {

@@ -15,5 +15,7 @@ var (
 
 func main() {
 	cli.Version = version
+	cli.Commit = commit
+	cli.BuildTime = buildTime
 	os.Exit(cli.RunWithHandler(os.Args[1:], os.Stdout, os.Stderr, app.New()))
 }
