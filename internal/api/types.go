@@ -23,6 +23,7 @@ const (
 	CommandStackRemove     CommandName = "stack.remove"
 	CommandStackList       CommandName = "stack.list"
 	CommandStackDelete     CommandName = "stack.delete"
+	CommandView            CommandName = "view"
 	CommandUnknown         CommandName = "unknown"
 )
 
@@ -426,6 +427,39 @@ type StackData struct {
 	MemberIIDs []int  `json:"member_iids"`
 	CreatedAt  string `json:"created_at"`
 	UpdatedAt  string `json:"updated_at"`
+}
+
+// ViewData is the published shape of `mrstack view`: one or more named stacks
+// rendered with per-member status. When Live is false (e.g. `view --all`
+// without --refresh) member status fields are empty and only the stored
+// membership is reported.
+type ViewData struct {
+	Stacks []ViewStack `json:"stacks"`
+	Live   bool        `json:"live"`
+}
+
+// ViewStack is a single named stack within a view, with its ordered members.
+type ViewStack struct {
+	Name          string       `json:"name"`
+	Host          string       `json:"host"`
+	Project       string       `json:"project"`
+	DefaultBranch string       `json:"default_branch,omitempty"`
+	Members       []ViewMember `json:"members"`
+	Note          string       `json:"note,omitempty"`
+}
+
+// ViewMember is one MR in a viewed stack, in chain order. Status fields are
+// populated only when the view was live-fetched.
+type ViewMember struct {
+	Position       int    `json:"position"`
+	IID            int    `json:"iid"`
+	Title          string `json:"title,omitempty"`
+	SourceBranch   string `json:"source_branch,omitempty"`
+	TargetBranch   string `json:"target_branch,omitempty"`
+	State          string `json:"state,omitempty"`
+	MergeStatus    string `json:"merge_status,omitempty"`
+	PipelineStatus string `json:"pipeline_status,omitempty"`
+	WebURL         string `json:"web_url,omitempty"`
 }
 
 type LogRequest struct {

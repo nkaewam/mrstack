@@ -390,6 +390,35 @@
           "command": {
             "properties": {
               "name": {
+                "const": "view"
+              }
+            }
+          },
+          "outcome": {
+            "properties": {
+              "class": {
+                "const": "authoritative"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "required": [
+              "view"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "command": {
+            "properties": {
+              "name": {
                 "enum": [
                   "restack.abandon",
                   "unknown"
@@ -568,6 +597,7 @@
             "stack.remove",
             "stack.delete",
             "stack.list",
+            "view",
             "unknown"
           ]
         },
@@ -3412,6 +3442,50 @@
       },
       "additionalProperties": true
     },
+    "viewData": {
+      "type": "object",
+      "required": ["stacks", "live"],
+      "properties": {
+        "stacks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/viewStack" }
+        },
+        "live": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "viewStack": {
+      "type": "object",
+      "required": ["name", "host", "project", "members"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "host": { "type": "string", "minLength": 1 },
+        "project": { "type": "string", "minLength": 1 },
+        "default_branch": { "type": "string" },
+        "members": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/viewMember" }
+        },
+        "note": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "viewMember": {
+      "type": "object",
+      "required": ["position", "iid"],
+      "properties": {
+        "position": { "type": "integer", "minimum": 0 },
+        "iid": { "type": "integer", "minimum": 1 },
+        "title": { "type": "string" },
+        "source_branch": { "type": "string" },
+        "target_branch": { "type": "string" },
+        "state": { "type": "string" },
+        "merge_status": { "type": "string" },
+        "pipeline_status": { "type": "string" },
+        "web_url": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
     "logRequest": {
       "type": "object",
       "required": [
@@ -3548,6 +3622,9 @@
           "items": {
             "$ref": "#/$defs/stackData"
           }
+        },
+        "view": {
+          "$ref": "#/$defs/viewData"
         },
         "log_request": {
           "$ref": "#/$defs/logRequest"

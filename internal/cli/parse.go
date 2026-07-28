@@ -29,6 +29,7 @@ const (
 	CommandStackRemove     CommandName = "stack.remove"
 	CommandStackList       CommandName = "stack.list"
 	CommandStackDelete     CommandName = "stack.delete"
+	CommandView            CommandName = "view"
 	CommandUnknown         CommandName = "unknown"
 )
 
@@ -75,6 +76,7 @@ type Invocation struct {
 	StackName  string
 	MemberIIDs []int
 	AllStacks  bool
+	Refresh    bool
 }
 
 type LayerBoundary struct {
@@ -102,6 +104,7 @@ Commands:
   stack remove <name> <iid> [<iid>...]
   stack list [--all]
   stack delete <name>
+  view [<name>] [--all] [--refresh]
 
 Global options:
   --json  --no-input  --yes  --remote <name>
@@ -161,6 +164,9 @@ func Parse(args []string) (Invocation, error) {
 		err = parseHistory(clean[1:], &inv)
 	case "stack":
 		err = parseStack(clean[1:], &inv)
+	case "view":
+		inv.Name = CommandView
+		err = parseView(clean[1:], &inv)
 	default:
 		inv.Name = CommandUnknown
 		err = Invalid("unknown_command", fmt.Sprintf("unknown command %q", clean[0]))
@@ -761,6 +767,33 @@ func mutationNeedsYes(name CommandName) bool {
 	}
 }
 
+// parseView accepts an optional positional stack name and the flags --all and
+// --refresh. --all switches to the cross-project view; --refresh forces a live
+// fetch (only meaningful with --all, since the current-repo view is always live).
+func parseView(args []string, inv *Invocation) error {
+	var positionals []string
+	for _, arg := range args {
+		switch arg {
+		case "--all":
+			inv.AllStacks = true
+		case "--refresh":
+			inv.Refresh = true
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return unknownOption(arg)
+			}
+			positionals = append(positionals, arg)
+		}
+	}
+	if len(positionals) > 1 {
+		return Invalid("invalid_arguments", "view accepts at most one stack name")
+	}
+	if len(positionals) == 1 {
+		inv.StackName = positionals[0]
+	}
+	return nil
+}
+
 func commandNameFromArgs(args []string) CommandName {
 	clean, _, _ := extractGlobals(args)
 	if len(clean) == 0 {
@@ -817,6 +850,8 @@ func commandNameFromArgs(args []string) CommandName {
 			}
 		}
 		return CommandUnknown
+	case "view":
+		return CommandView
 	}
 	return CommandUnknown
 }

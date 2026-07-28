@@ -80,6 +80,8 @@ func (h *Handler) Dispatch(ctx context.Context, inv cli.Invocation) (cli.Result,
 		return h.stackList(ctx, inv)
 	case cli.CommandStackDelete:
 		return h.stackDelete(ctx, inv)
+	case cli.CommandView:
+		return h.view(ctx, inv)
 	case cli.CommandRestackAbandon:
 		return h.restackAbandon(ctx, inv)
 	default:

@@ -175,6 +175,7 @@ type MRUser struct {
 type MergeRequest struct {
 	IID                 int         `json:"iid"`
 	State               string      `json:"state"`
+	Title               string      `json:"title"`
 	SourceProjectID     json.Number `json:"source_project_id"`
 	TargetProjectID     json.Number `json:"target_project_id"`
 	SourceBranch        string      `json:"source_branch"`

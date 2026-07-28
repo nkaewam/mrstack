@@ -91,6 +91,20 @@ func TestParseEveryDocumentedCommand(t *testing.T) {
 		{"stack delete", []string{"stack", "delete", "web-migration"}, CommandStackDelete, func(t *testing.T, i Invocation) {
 			equal(t, i.StackName, "web-migration")
 		}},
+		{"view", []string{"view"}, CommandView, nil},
+		{"view name", []string{"view", "web-migration"}, CommandView, func(t *testing.T, i Invocation) {
+			equal(t, i.StackName, "web-migration")
+		}},
+		{"view all", []string{"view", "--all"}, CommandView, func(t *testing.T, i Invocation) {
+			if !i.AllStacks {
+				t.Fatal("--all not parsed")
+			}
+		}},
+		{"view refresh", []string{"view", "--all", "--refresh"}, CommandView, func(t *testing.T, i Invocation) {
+			if !i.AllStacks || !i.Refresh {
+				t.Fatal("flags not parsed")
+			}
+		}},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -254,6 +268,8 @@ func TestInvalidInvocations(t *testing.T) {
 		{"stack remove bad iid", []string{"stack", "remove", "s", "-1"}, "invalid_arguments"},
 		{"stack delete no name", []string{"stack", "delete"}, "invalid_arguments"},
 		{"stack delete extra", []string{"stack", "delete", "a", "b"}, "invalid_arguments"},
+		{"view too many names", []string{"view", "a", "b"}, "invalid_arguments"},
+		{"view unknown flag", []string{"view", "--bogus"}, "invalid_arguments"},
 		{"stack list unknown flag", []string{"stack", "list", "--bogus"}, "invalid_arguments"},
 	}
 	for _, tt := range tests {
@@ -294,6 +310,10 @@ func TestMachineMutationsAcceptYesAndReadOnlyCommandsDoNotRequireIt(t *testing.T
 		{"stack", "list", "--json", "--no-input"},
 		{"stack", "list", "--all", "--json", "--no-input"},
 		{"stack", "delete", "web-migration", "--json", "--no-input", "--yes"},
+		{"view", "--json", "--no-input"},
+		{"view", "--all", "--json", "--no-input"},
+		{"view", "--all", "--refresh", "--json", "--no-input"},
+		{"view", "web-migration", "--json", "--no-input"},
 	}
 	for _, args := range valid {
 		if _, err := Parse(args); err != nil {
