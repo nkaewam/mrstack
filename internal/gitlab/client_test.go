@@ -301,7 +301,7 @@ func TestMergeRequestsEmptyArrayDecodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mrs != nil && len(mrs) != 0 {
+	if len(mrs) != 0 {
 		t.Fatalf("expected empty result, got %#v", mrs)
 	}
 }
