@@ -22,6 +22,56 @@ Start with the [complete user guide](docs/USER-GUIDE.md).
 Canonical source: `github.com/nkaewam/mrstack`. CI/CD and release automation
 use GitHub Actions; runtime GitLab access remains local through `glab`.
 
+## Installation
+
+`mrstack` is a single CGO-free Go binary. Prebuilt archives are published for
+macOS and Linux on AMD64 and ARM64. Git and an authenticated `glab` are
+required at runtime.
+
+### Homebrew (recommended)
+
+Install the appropriate prebuilt release binary from the
+[`nkaewam/tap`](https://github.com/nkaewam/homebrew-tap) tap:
+
+```sh
+brew install nkaewam/tap/mrstack
+```
+
+Go is not required. To upgrade later:
+
+```sh
+brew update
+brew upgrade mrstack
+```
+
+Verify that the executable is available:
+
+```sh
+command -v mrstack
+```
+
+### GitHub Releases
+
+Without Homebrew, download and verify the archive for the current operating
+system and CPU architecture from
+[GitHub Releases](https://github.com/nkaewam/mrstack/releases). Set `VERSION`
+to the release tag to install:
+
+```sh
+VERSION=v0.1.0
+case "$(uname -s)" in
+  Darwin) os=darwin ;;
+  Linux)  os=linux  ;;
+esac
+case "$(uname -m)" in
+  arm64|aarch64) arch=arm64 ;;
+  x86_64|amd64)   arch=amd64 ;;
+esac
+curl -LO "https://github.com/nkaewam/mrstack/releases/download/${VERSION}/mrstack_${VERSION#v}_${os}_${arch}.tar.gz"
+tar -xzf "mrstack_${VERSION#v}_${os}_${arch}.tar.gz"
+install -m 0755 "mrstack_${VERSION#v}_${os}_${arch}/mrstack" /usr/local/bin/mrstack
+```
+
 ## Quick start
 
 Go 1.24 or newer, Task 3, `git`, and an authenticated `glab` are required.
