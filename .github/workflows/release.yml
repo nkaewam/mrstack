@@ -91,12 +91,9 @@ jobs:
           tar -czf "${name}.tar.gz" "${name}"
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
       - name: Generate SBOM
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
         run: |
           go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.9.0 \
-            mod -json -output "mrstack_${RELEASE_TAG#v}_${GOOS}_${GOARCH}.sbom.json"
+            mod -json -output "mrstack_${RELEASE_TAG#v}_${{ matrix.goos }}_${{ matrix.goarch }}.sbom.json"
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-path: mrstack_*.tar.gz
