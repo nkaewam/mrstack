@@ -43,6 +43,14 @@ func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (
 	if err != nil {
 		return cli.Result{}, cli.Invalid("invalid_arguments", err.Error())
 	}
+	// A positional selector that matches a named stack bound to this repository
+	// runs the explicit named-stack check path instead of autodiscovery. This
+	// avoids fetching every project MR and validates the user-curated chain.
+	if inv.Selector.Value != "" && inv.Selector.StackID == "" {
+		if handled, res, herr := h.checkNamedStack(ctx, inv, rc, mode); handled {
+			return res, herr
+		}
+	}
 	mrs, err := rc.client.MergeRequests(ctx, rc.project.ID.String(), "all")
 	if err != nil {
 		return cli.Result{}, classifyGlab("list merge requests", err)
@@ -96,54 +104,71 @@ func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (
 	domainMRs := make([]stack.MergeRequest, 0, len(mrs))
 	byIID := make(map[int]int, len(mrs))
 	for i, mr := range mrs {
-		sourceSHA := strings.ToLower(mr.SHA)
-		sourceExists := fullOID(sourceSHA) && branches[mr.SourceBranch] == sourceSHA
-		targetSHA := branches[mr.TargetBranch]
-		state := stack.MRState(mr.State)
-		switch state {
-		case stack.StateOpen, stack.StateClosed, stack.StateMerged:
-		default:
-			// Unknown provider lifecycle values cannot be allowed to look open.
-			state = stack.StateClosed
-		}
-		integrationRevision := strings.ToLower(mr.SquashCommitSHA)
-		if !fullOID(integrationRevision) {
-			integrationRevision = strings.ToLower(mr.MergeCommitSHA)
-		}
-		integrationInBase := false
-		if fullOID(integrationRevision) {
-			integrationInBase, _ = rc.repo.IsAncestor(ctx, integrationRevision, baseSHA)
-		}
-		historicalTarget := strings.ToLower(mr.DiffRefs.HeadSHA)
-		if !fullOID(historicalTarget) {
-			historicalTarget = sourceSHA
-		}
-		if !fullOID(historicalTarget) {
-			historicalTarget = ""
-		}
-		sourceProjectID := mr.SourceProjectID.String()
-		if sourceProjectID == "" {
-			sourceProjectID = rc.project.ID.String()
-		}
-		targetProjectID := mr.TargetProjectID.String()
-		if targetProjectID == "" {
-			targetProjectID = rc.project.ID.String()
-		}
-		domainMRs = append(domainMRs, stack.MergeRequest{
-			IID: mr.IID, ProjectID: rc.project.ID.String(),
-			SourceProjectID: sourceProjectID, TargetProjectID: targetProjectID,
-			SourceBranch: mr.SourceBranch, TargetBranch: mr.TargetBranch,
-			SourceSHA: sourceSHA, TargetSHA: targetSHA, State: state,
-			SourceBranchExists: sourceExists, TargetBranchExists: fullOID(targetSHA),
-			IntegrationRevision: integrationRevision, IntegrationInBase: integrationInBase,
-			HistoricalTargetSHA: historicalTarget,
-		})
+		domainMRs = append(domainMRs, toDomainMR(ctx, mr, rc, branches, baseSHA))
 		byIID[mr.IID] = i
 	}
 	discovered := stack.Discover(stack.DiscoveryInput{
 		ProjectID: rc.project.ID.String(), DefaultBranch: rc.project.DefaultBranch,
 		BaseSHA: baseSHA, Mode: mode, Selector: selector, MergeRequests: domainMRs,
 	})
+	return h.assessCheck(ctx, inv, rc, mode, mrs, byIID, selectorAPI, discovered, persist)
+}
+
+// toDomainMR normalizes a gitlab.MergeRequest into the I/O-free stack domain
+// shape, resolving branch existence and merged-predecessor evidence against the
+// fetched branch revisions. Shared by the autodiscovery and named-stack paths.
+func toDomainMR(ctx context.Context, mr gitlab.MergeRequest, rc repositoryContext,
+	branches map[string]string, baseSHA string) stack.MergeRequest {
+	sourceSHA := strings.ToLower(mr.SHA)
+	sourceExists := fullOID(sourceSHA) && branches[mr.SourceBranch] == sourceSHA
+	targetSHA := branches[mr.TargetBranch]
+	state := stack.MRState(mr.State)
+	switch state {
+	case stack.StateOpen, stack.StateClosed, stack.StateMerged:
+	default:
+		// Unknown provider lifecycle values cannot be allowed to look open.
+		state = stack.StateClosed
+	}
+	integrationRevision := strings.ToLower(mr.SquashCommitSHA)
+	if !fullOID(integrationRevision) {
+		integrationRevision = strings.ToLower(mr.MergeCommitSHA)
+	}
+	integrationInBase := false
+	if fullOID(integrationRevision) {
+		integrationInBase, _ = rc.repo.IsAncestor(ctx, integrationRevision, baseSHA)
+	}
+	historicalTarget := strings.ToLower(mr.DiffRefs.HeadSHA)
+	if !fullOID(historicalTarget) {
+		historicalTarget = sourceSHA
+	}
+	if !fullOID(historicalTarget) {
+		historicalTarget = ""
+	}
+	sourceProjectID := mr.SourceProjectID.String()
+	if sourceProjectID == "" {
+		sourceProjectID = rc.project.ID.String()
+	}
+	targetProjectID := mr.TargetProjectID.String()
+	if targetProjectID == "" {
+		targetProjectID = rc.project.ID.String()
+	}
+	return stack.MergeRequest{
+		IID: mr.IID, ProjectID: rc.project.ID.String(),
+		SourceProjectID: sourceProjectID, TargetProjectID: targetProjectID,
+		SourceBranch: mr.SourceBranch, TargetBranch: mr.TargetBranch,
+		SourceSHA: sourceSHA, TargetSHA: targetSHA, State: state,
+		SourceBranchExists: sourceExists, TargetBranchExists: fullOID(targetSHA),
+		IntegrationRevision: integrationRevision, IntegrationInBase: integrationInBase,
+		HistoricalTargetSHA: historicalTarget,
+	}
+}
+
+// assessCheck runs the post-discovery assessment tail shared by the autodiscovery
+// and explicit named-stack check paths: alignment, pipelines, CI findings,
+// envelope assembly, persistence, and human rendering.
+func (h *Handler) assessCheck(ctx context.Context, inv cli.Invocation, rc repositoryContext,
+	mode stack.Mode, mrs []gitlab.MergeRequest, byIID map[int]int,
+	selectorAPI api.Selector, discovered stack.DiscoveryResult, persist bool) (cli.Result, error) {
 	allFindings := append([]stack.Finding(nil), discovered.Findings...)
 	alignment := stack.AlignmentResult{Aligned: true, AffectedSuffixStart: -1}
 	if len(discovered.Stack.Members) > 0 {

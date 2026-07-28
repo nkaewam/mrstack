@@ -15,31 +15,48 @@ type DiscoveryResult struct {
 // relationships. Input ordering and any journal ordering are irrelevant.
 func Discover(in DiscoveryInput) DiscoveryResult {
 	result := DiscoveryResult{}
-	anchor, fs := selectAnchor(in)
-	if len(fs) != 0 {
-		result.Findings = fs
-		result.Disposition = ResolveDisposition(fs, DispositionReady)
-		return result
-	}
-	if !anchor.sameProject(in.ProjectID) {
-		f := finding(FindingCrossProjectMember, DispositionInvalid, "selected merge request spans another project", anchor.IID)
-		return discoveryFailure(f)
-	}
-
-	open := make([]MergeRequest, 0, len(in.MergeRequests))
-	for _, mr := range in.MergeRequests {
-		if mr.State == StateOpen {
-			open = append(open, mr)
+	var component []MergeRequest
+	var anchor MergeRequest
+	if in.Explicit {
+		// A user-curated named stack: the supplied MRs are the membership. Skip
+		// selector anchor selection and BFS; open members form the component.
+		for _, mr := range in.MergeRequests {
+			if mr.State == StateOpen {
+				component = append(component, mr)
+			}
 		}
-	}
+		if len(component) == 0 {
+			return discoveryFailure(finding(FindingNoStackSelected, DispositionInvalid, "named stack has no open members", 0))
+		}
+		anchor = component[0]
+	} else {
+		anchor, fs := selectAnchor(in)
+		if len(fs) != 0 {
+			result.Findings = fs
+			result.Disposition = ResolveDisposition(fs, DispositionReady)
+			return result
+		}
+		if !anchor.sameProject(in.ProjectID) {
+			f := finding(FindingCrossProjectMember, DispositionInvalid, "selected merge request spans another project", anchor.IID)
+			return discoveryFailure(f)
+		}
 
-	component, cycle := openComponent(anchor, open)
-	if cycle {
-		return discoveryFailure(finding(FindingCycle, DispositionInvalid, "merge request relationships contain a cycle", anchor.IID))
-	}
-	for _, mr := range component {
-		if !mr.sameProject(in.ProjectID) {
-			return discoveryFailure(finding(FindingCrossProjectMember, DispositionInvalid, "stack member spans another project", mr.IID))
+		open := make([]MergeRequest, 0, len(in.MergeRequests))
+		for _, mr := range in.MergeRequests {
+			if mr.State == StateOpen {
+				open = append(open, mr)
+			}
+		}
+
+		var cycle bool
+		component, cycle = openComponent(anchor, open)
+		if cycle {
+			return discoveryFailure(finding(FindingCycle, DispositionInvalid, "merge request relationships contain a cycle", anchor.IID))
+		}
+		for _, mr := range component {
+			if !mr.sameProject(in.ProjectID) {
+				return discoveryFailure(finding(FindingCrossProjectMember, DispositionInvalid, "stack member spans another project", mr.IID))
+			}
 		}
 	}
 

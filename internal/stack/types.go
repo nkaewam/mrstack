@@ -73,6 +73,11 @@ type DiscoveryInput struct {
 	// MergeRequests must contain all open, closed, and merged candidates for
 	// every branch edge reachable from the selected MR.
 	MergeRequests []MergeRequest
+	// Explicit names a user-curated stack: the supplied MergeRequests ARE the
+	// membership, and discovery skips selector-based anchor selection and BFS.
+	// Open members form the component directly; merged/closed members serve as
+	// lifecycle evidence. Selector is ignored when Explicit is true.
+	Explicit bool
 }
 
 type Stack struct {

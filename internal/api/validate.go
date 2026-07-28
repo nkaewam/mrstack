@@ -275,7 +275,7 @@ func validateStack(s *Stack) error {
 		!shaPattern.MatchString(s.Base.SHA) || len(s.Members) == 0 || len(s.Members) > 10 {
 		return errors.New("api: invalid stack identity, mode, project, base, or depth")
 	}
-	validSelector := map[string]bool{"current_branch": true, "branch": true, "mr": true, "tracked_stack": true}
+	validSelector := map[string]bool{"current_branch": true, "branch": true, "mr": true, "tracked_stack": true, "named_stack": true}
 	if !validSelector[s.Selector.Kind] || s.Selector.Value == "" ||
 		(s.Selector.Kind == "mr" && !validDecimal(s.Selector.Value)) {
 		return errors.New("api: invalid stack selector")

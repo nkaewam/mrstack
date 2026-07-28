@@ -747,7 +747,8 @@
             "current_branch",
             "branch",
             "mr",
-            "tracked_stack"
+            "tracked_stack",
+            "named_stack"
           ]
         },
         "value": {

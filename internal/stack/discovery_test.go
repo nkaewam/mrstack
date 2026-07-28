@@ -46,6 +46,64 @@ func discover(mrs []MergeRequest, selector Selector) DiscoveryResult {
 	})
 }
 
+func discoverExplicit(mrs []MergeRequest) DiscoveryResult {
+	return Discover(DiscoveryInput{
+		ProjectID: project, DefaultBranch: "main", BaseSHA: baseSHA,
+		Mode: ModeLegacy, MergeRequests: mrs, Explicit: true,
+	})
+}
+
+func TestDiscoverExplicitOrdersAndValidatesChain(t *testing.T) {
+	t.Parallel()
+	got := discoverExplicit(chain(3))
+	if len(got.Stack.Members) != 3 {
+		t.Fatalf("expected 3 members, got %d: %+v", len(got.Stack.Members), got.Stack.Members)
+	}
+	if got.Stack.Members[0].TargetBranch != "main" {
+		t.Fatalf("front must target main: %+v", got.Stack.Members[0])
+	}
+	if len(got.Findings) != 0 {
+		t.Fatalf("expected no findings for a clean chain: %+v", got.Findings)
+	}
+}
+
+func TestDiscoverExplicitRejectsFork(t *testing.T) {
+	t.Parallel()
+	// Two members target the same source branch -> fork.
+	mrs := []MergeRequest{
+		openMR(1, "feature/a", "main"),
+		openMR(2, "feature/b", "feature/a"),
+		openMR(3, "feature/c", "feature/a"),
+	}
+	got := discoverExplicit(mrs)
+	requireFinding(t, got, FindingFork, DispositionInvalid)
+}
+
+func TestDiscoverExplicitRejectsBrokenLink(t *testing.T) {
+	t.Parallel()
+	mrs := []MergeRequest{
+		openMR(1, "feature/a", "main"),
+		openMR(3, "feature/c", "feature/b"), // feature/b has no member
+	}
+	got := discoverExplicit(mrs)
+	// Two disconnected components produce two fronts, which is reported as a
+	// cyclic/non-linear relationship rather than an ambiguous edge.
+	if len(got.Findings) == 0 {
+		t.Fatal("expected a finding for a broken chain")
+	}
+	if got.Disposition != DispositionInvalid {
+		t.Fatalf("expected invalid disposition, got %q", got.Disposition)
+	}
+}
+
+func TestDiscoverExplicitNoOpenMembers(t *testing.T) {
+	t.Parallel()
+	merged := openMR(1, "feature/a", "main")
+	merged.State = StateMerged
+	got := discoverExplicit([]MergeRequest{merged})
+	requireFinding(t, got, FindingNoStackSelected, DispositionInvalid)
+}
+
 func requireFinding(t *testing.T, got DiscoveryResult, code FindingCode, disposition Disposition) {
 	t.Helper()
 	if got.Disposition != disposition {
