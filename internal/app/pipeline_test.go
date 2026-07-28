@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/nkaewam/mrstack/internal/api"
 	"github.com/nkaewam/mrstack/internal/cli"
+	"github.com/nkaewam/mrstack/internal/gitexec"
 	"github.com/nkaewam/mrstack/internal/gitlab"
 	"github.com/nkaewam/mrstack/internal/stack"
 )
@@ -158,27 +160,27 @@ func TestClassifyPipelineKind(t *testing.T) {
 func TestCheckPipelineEvidenceIsSchemaValidForValidAndAmbiguousMergedResults(t *testing.T) {
 	tests := []struct {
 		name        string
-		associated  string
+		mrPipelines string
 		parents     func(source, target string) []string
 		disposition string
 	}{
 		{
-			name: "valid", associated: `[{"iid":1}]`,
+			name: "valid", mrPipelines: `[{"id":9}]`,
 			parents:     func(source, target string) []string { return []string{target, source} },
 			disposition: "ready",
 		},
 		{
-			name: "association mismatch", associated: `[{"iid":2}]`,
+			name: "association mismatch", mrPipelines: `[{"id":10}]`,
 			parents:     func(source, target string) []string { return []string{source, target} },
 			disposition: "human_required",
 		},
 		{
-			name: "ambiguous association", associated: `[{"iid":1},{"iid":2}]`,
+			name: "missing pipeline", mrPipelines: `[]`,
 			parents:     func(source, target string) []string { return []string{source, target} },
 			disposition: "human_required",
 		},
 		{
-			name: "parent mismatch", associated: `[{"iid":1}]`,
+			name: "parent mismatch", mrPipelines: `[{"id":9}]`,
 			parents:     func(source, target string) []string { return []string{source, strings.Repeat("d", 40)} },
 			disposition: "human_required",
 		},
@@ -205,7 +207,7 @@ func TestCheckPipelineEvidenceIsSchemaValidForValidAndAmbiguousMergedResults(t *
 				"id":9,"sha":"` + syntheticOID + `","ref":"refs/merge-requests/1/merge",
 				"status":"success","source":"merge_request_event","web_url":"https://gitlab.example/pipelines/9"
 			}`)
-			responses["/projects/42/pipelines/9/merge_requests"] = json.RawMessage(tt.associated)
+			responses["/projects/42/merge_requests/1/pipelines?per_page=100"] = json.RawMessage(tt.mrPipelines)
 			responses["/projects/42/repository/commits/"+syntheticOID] = json.RawMessage(
 				`{"id":"` + syntheticOID + `","parent_ids":` + string(parentsJSON) + `}`)
 			handler := &Handler{
@@ -311,6 +313,9 @@ func TestCheckExactSourcePipelineDoesNotRequireMRAssociation(t *testing.T) {
 				if strings.Contains(strings.Join(call, " "), "/pipelines/9/merge_requests") {
 					t.Fatalf("exact-source %s pipeline queried unnecessary MR association: %q", tt.name, call)
 				}
+				if strings.Contains(strings.Join(call, " "), "/merge_requests/1/pipelines") {
+					t.Fatalf("exact-source %s pipeline queried MR pipelines: %q", tt.name, call)
+				}
 			}
 			var envelope struct {
 				Disposition string `json:"disposition"`
@@ -335,19 +340,79 @@ func TestCheckExactSourcePipelineDoesNotRequireMRAssociation(t *testing.T) {
 	}
 }
 
-func TestPipelineAssociationRequiresExactlySelectedMR(t *testing.T) {
-	if !pipelineAssociatedExactly([]gitlab.PipelineMergeRequest{{IID: 7}}, 7) {
-		t.Fatal("one exact association was rejected")
+func TestCheckMergedResultsDoesNotCallBrokenPipelineToMREndpoint(t *testing.T) {
+	repo, _, mainOID, sourceOID, _ := createStackRepository(t)
+	syntheticOID := strings.Repeat("c", 40)
+	payload := []map[string]any{{
+		"iid": 1, "state": "opened", "source_branch": "feature/one", "target_branch": "main",
+		"sha": sourceOID, "web_url": "https://gitlab.example/group/project/-/merge_requests/1",
+		"author":        map[string]any{"id": 7, "username": "developer"},
+		"diff_refs":     map[string]any{"base_sha": mainOID, "head_sha": sourceOID, "start_sha": mainOID},
+		"head_pipeline": map[string]any{"id": 9},
+	}}
+	var calls [][]string
+	stateDir, stacksDir := testDirs(t)
+	responses := glabProjectResponses(true)
+	addPerMREndpoints(responses, payload)
+	responses["/projects/42/pipelines/9"] = json.RawMessage(`{
+		"id":9,"sha":"` + syntheticOID + `","ref":"refs/merge-requests/1/merge",
+		"status":"success","source":"merge_request_event","web_url":"https://gitlab.example/pipelines/9"
+	}`)
+	responses["/projects/42/merge_requests/1/pipelines?per_page=100"] = json.RawMessage(`[{"id":9}]`)
+	responses["/projects/42/repository/commits/"+syntheticOID] = json.RawMessage(
+		`{"id":"` + syntheticOID + `","parent_ids":["` + mainOID + `","` + sourceOID + `"]}`)
+	handler := &Handler{
+		Runner: fakeGlabRunner{
+			calls:     &calls,
+			responses: responses,
+			dynamic: func(endpoint string, _ []string) (gitexec.Result, error) {
+				if endpoint == "/projects/42/pipelines/9/merge_requests" {
+					return gitexec.Result{}, fmt.Errorf("glab: HTTP 404")
+				}
+				return gitexec.Result{}, nil
+			},
+		},
+		Dir: repo, StateDir: stateDir, StacksDir: stacksDir,
+		Now: func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
 	}
-	for name, associated := range map[string][]gitlab.PipelineMergeRequest{
-		"missing":    nil,
-		"mismatch":   {{IID: 8}},
-		"ambiguous":  {{IID: 7}, {IID: 8}},
-		"duplicated": {{IID: 7}, {IID: 7}},
+	registerNamedStack(t, handler, testStackName, 1)
+	var stdout, stderr bytes.Buffer
+	exit := cli.RunWithHandler([]string{
+		"--json", "--no-input", "--remote", "origin", "check", testStackName,
+	}, &stdout, &stderr, handler)
+	if exit != 0 {
+		t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout.String(), stderr.String())
+	}
+	for _, call := range calls {
+		if strings.Contains(strings.Join(call, " "), "/pipelines/9/merge_requests") {
+			t.Fatalf("check called broken reverse-lookup endpoint: %q", call)
+		}
+	}
+	var envelope struct {
+		Disposition string `json:"disposition"`
+		Stack       struct {
+			SnapshotID string `json:"snapshot_id"`
+		} `json:"stack"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode output: %v\n%s", err, stdout.String())
+	}
+	if envelope.Disposition != "ready" || envelope.Stack.SnapshotID == "" {
+		t.Fatalf("check did not complete with snapshot: %+v\n%s", envelope, stdout.String())
+	}
+}
+
+func TestPipelineAssociationRequiresHeadPipelineInMRList(t *testing.T) {
+	if !pipelineAssociatedWithMR([]gitlab.Pipeline{{ID: json.Number("9")}}, "9") {
+		t.Fatal("matching pipeline was rejected")
+	}
+	for name, pipelines := range map[string][]gitlab.Pipeline{
+		"missing":  nil,
+		"mismatch": {{ID: json.Number("10")}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if pipelineAssociatedExactly(associated, 7) {
-				t.Fatalf("invalid association accepted: %#v", associated)
+			if pipelineAssociatedWithMR(pipelines, "9") {
+				t.Fatalf("invalid association accepted: %#v", pipelines)
 			}
 		})
 	}

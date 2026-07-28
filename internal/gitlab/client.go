@@ -261,13 +261,6 @@ type Pipeline struct {
 	Source string      `json:"source"`
 }
 
-// PipelineMergeRequest is the deliberately small association shape returned
-// by GitLab's pipeline-to-merge-request endpoint. The complete MR payload is
-// not needed to prove the association.
-type PipelineMergeRequest struct {
-	IID int `json:"iid"`
-}
-
 // Commit contains only immutable commit evidence needed to validate a merged
 // results pipeline. ParentIDs must be checked exactly by the caller.
 type Commit struct {
@@ -319,17 +312,15 @@ func (c Client) Pipeline(ctx context.Context, projectID, pipelineID string) (Pip
 	return pipeline, err
 }
 
-func (c Client) PipelineMergeRequests(ctx context.Context, projectID, pipelineID string) ([]PipelineMergeRequest, error) {
+func (c Client) MergeRequestPipelines(ctx context.Context, projectID string, iid int) ([]Pipeline, error) {
 	prefix, err := projectPrefix(projectID)
 	if err != nil {
 		return nil, err
 	}
-	if !validDecimalID(pipelineID) {
-		return nil, errors.New("pipeline ID must be decimal")
+	if iid <= 0 {
+		return nil, errors.New("MR IID must be positive")
 	}
-	var requests []PipelineMergeRequest
-	err = c.api(ctx, prefix+"/pipelines/"+pipelineID+"/merge_requests", &requests)
-	return requests, err
+	return apiArray[Pipeline](c, ctx, fmt.Sprintf("%s/merge_requests/%d/pipelines?per_page=100", prefix, iid))
 }
 
 func (c Client) Commit(ctx context.Context, projectID, oid string) (Commit, error) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -160,12 +161,12 @@ func (h *Handler) assessCheck(ctx context.Context, inv cli.Invocation, rc reposi
 			domainPipeline.Kind = stack.PipelineUnknown
 		}
 		if kind == stack.PipelineMergedResult {
-			associated, associationErr := rc.client.PipelineMergeRequests(
-				ctx, rc.project.ID.String(), head.ID.String())
+			mrPipelines, associationErr := rc.client.MergeRequestPipelines(
+				ctx, rc.project.ID.String(), member.IID)
 			if associationErr != nil {
-				return cli.Result{}, classifyGlab("read pipeline merge request association", associationErr)
+				return cli.Result{}, classifyGlab("read merge request pipelines", associationErr)
 			}
-			domainPipeline.AssociatedWithMR = pipelineAssociatedExactly(associated, member.IID)
+			domainPipeline.AssociatedWithMR = pipelineAssociatedWithMR(mrPipelines, head.ID.String())
 		}
 		if kind == stack.PipelineMergedResult {
 			// A merged-results pipeline runs against a synthetic commit, not
@@ -388,8 +389,10 @@ func classifyPipelineKind(p gitlab.Pipeline, memberIID int) stack.PipelineKind {
 	}
 }
 
-func pipelineAssociatedExactly(requests []gitlab.PipelineMergeRequest, memberIID int) bool {
-	return len(requests) == 1 && requests[0].IID == memberIID
+func pipelineAssociatedWithMR(pipelines []gitlab.Pipeline, pipelineID string) bool {
+	return slices.ContainsFunc(pipelines, func(p gitlab.Pipeline) bool {
+		return p.ID.String() == pipelineID
+	})
 }
 
 func buildAPIStack(observedAt string, rc repositoryContext, selector api.Selector, mode stack.Mode,
