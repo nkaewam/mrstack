@@ -186,6 +186,12 @@ jobs:
             -checksums ../dist/SHA256SUMS \
             -tag "${RELEASE_TAG}"
           ruby -c ../tap/Formula/mrstack.rb
+          depends_line="$(grep -n 'depends_on' ../tap/Formula/mrstack.rb | head -1 | cut -d: -f1)"
+          on_macos_line="$(grep -n 'on_macos' ../tap/Formula/mrstack.rb | head -1 | cut -d: -f1)"
+          if [ -z "${depends_line}" ] || [ -z "${on_macos_line}" ] || [ "${depends_line}" -gt "${on_macos_line}" ]; then
+            echo "::error::depends_on must appear before on_macos in Formula/mrstack.rb"
+            exit 1
+          fi
       - name: Commit and push formula
         working-directory: tap
         run: |
