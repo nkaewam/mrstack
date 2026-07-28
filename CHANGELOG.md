@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1](https://github.com/nkaewam/mrstack/compare/v0.3.0...v0.3.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* use MR pipelines endpoint for merged-results CI association ([a123f06](https://github.com/nkaewam/mrstack/commit/a123f06c6ea80ae79e3e236c7e8157582785a44d))
+* use MR pipelines endpoint for merged-results CI association ([39e43c2](https://github.com/nkaewam/mrstack/commit/39e43c2a5a919227e6bf06843c4445aebe1fd751))
+
 ## [0.3.0](https://github.com/nkaewam/mrstack/compare/v0.2.1...v0.3.0) (2026-07-28)
 
 
