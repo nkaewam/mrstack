@@ -329,7 +329,9 @@
               "name": {
                 "enum": [
                   "stack.create",
-                  "stack.add"
+                  "stack.add",
+                  "stack.remove",
+                  "stack.delete"
                 ]
               }
             }
@@ -563,6 +565,8 @@
             "history.prune",
             "stack.create",
             "stack.add",
+            "stack.remove",
+            "stack.delete",
             "stack.list",
             "unknown"
           ]

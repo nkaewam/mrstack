@@ -847,6 +847,16 @@ func validateCommandData(e Envelope) error {
 			return err
 		}
 		return validateStackData(e.Data["stack"].(StackData))
+	case CommandStackRemove:
+		if err := typeOK("stack", StackData{}); err != nil {
+			return err
+		}
+		return validateStackData(e.Data["stack"].(StackData))
+	case CommandStackDelete:
+		if err := typeOK("stack", StackData{}); err != nil {
+			return err
+		}
+		return validateStackData(e.Data["stack"].(StackData))
 	case CommandStackList:
 		return typeOK("stacks", []StackData{})
 	case CommandCILogs:
@@ -1104,7 +1114,8 @@ func validCommand(name CommandName) bool {
 		CommandRestackContinue, CommandRestackAbort, CommandRestackRecover,
 		CommandRestackAbandon, CommandCILogs, CommandHistoryShow,
 		CommandHistoryAlias, CommandHistoryPrune,
-		CommandStackCreate, CommandStackAdd, CommandStackList, CommandUnknown:
+		CommandStackCreate, CommandStackAdd, CommandStackList, CommandStackRemove,
+		CommandStackDelete, CommandUnknown:
 		return true
 	default:
 		return false

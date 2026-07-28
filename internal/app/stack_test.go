@@ -234,3 +234,111 @@ func TestStackCreateRequiresRepository(t *testing.T) {
 		t.Fatalf("expected git/repository error, got: %q", msg)
 	}
 }
+
+func TestStackRemoveDeletesMembersAndRejectsUnknown(t *testing.T) {
+	repo, _, _, _, _ := createStackRepository(t)
+	h, _ := stackHandler(t, repo)
+
+	if exit, _, _ := runStack(t, h,
+		"--json", "--no-input", "--remote", "origin", "stack", "create", "s"); exit != 0 {
+		t.Fatalf("create failed: exit=%d", exit)
+	}
+	if exit, _, _ := runStack(t, h,
+		"--json", "--no-input", "stack", "add", "s", "3061", "3062", "3063"); exit != 0 {
+		t.Fatalf("add failed: exit=%d", exit)
+	}
+	exit, stdout, _ := runStack(t, h,
+		"--json", "--no-input", "stack", "remove", "s", "3062", "9999")
+	if exit != 0 {
+		t.Fatalf("remove failed: exit=%d", exit)
+	}
+	validateStackEnvelope(t, stdout)
+	var env struct {
+		Data struct {
+			Stack struct {
+				Members []int `json:"member_iids"`
+			} `json:"stack"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(stdout, &env); err != nil {
+		t.Fatal(err)
+	}
+	if len(env.Data.Stack.Members) != 2 ||
+		env.Data.Stack.Members[0] != 3061 || env.Data.Stack.Members[1] != 3063 {
+		t.Fatalf("remove left wrong members: %v", env.Data.Stack.Members)
+	}
+
+	// remove from a nonexistent stack is invalid_selector, not a store error.
+	exit, stdout, _ = runStack(t, h, "--json", "--no-input", "stack", "remove", "missing", "1")
+	if exit == 0 {
+		t.Fatal("remove from missing stack must fail")
+	}
+	if msg := machineErrorMessage(t, stdout); !bytes.Contains([]byte(msg), []byte("no stack named")) {
+		t.Fatalf("missing-stack error must mention 'no stack named': %q", msg)
+	}
+}
+
+func TestStackDeleteRequiresYesInMachineModeAndSucceeds(t *testing.T) {
+	repo, _, _, _, _ := createStackRepository(t)
+	h, _ := stackHandler(t, repo)
+
+	if exit, _, _ := runStack(t, h,
+		"--json", "--no-input", "--remote", "origin", "stack", "create", "s"); exit != 0 {
+		t.Fatalf("create failed: exit=%d", exit)
+	}
+	// Machine mode without --yes must be rejected before touching the store.
+	exit, stdout, _ := runStack(t, h, "--json", "--no-input", "stack", "delete", "s")
+	if exit == 0 {
+		t.Fatal("delete in machine mode without --yes must fail")
+	}
+	if msg := machineErrorMessage(t, stdout); !bytes.Contains([]byte(msg), []byte("--yes")) {
+		t.Fatalf("delete must demand --yes in machine mode: %q", msg)
+	}
+	// The stack must still exist (rejection happened before dispatch).
+	exit, stdout, _ = runStack(t, h, "--json", "--no-input", "stack", "list", "--all")
+	if exit != 0 {
+		t.Fatalf("list failed: exit=%d", exit)
+	}
+	var list struct {
+		Data struct {
+			Stacks []struct {
+				Name string `json:"name"`
+			} `json:"stacks"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(stdout, &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Data.Stacks) != 1 || list.Data.Stacks[0].Name != "s" {
+		t.Fatalf("stack must still exist after rejected delete: %+v", list.Data.Stacks)
+	}
+
+	// With --yes the stack is deleted and the response describes the removed stack.
+	exit, stdout, _ = runStack(t, h, "--json", "--no-input", "--yes", "stack", "delete", "s")
+	if exit != 0 {
+		t.Fatalf("delete with --yes failed: exit=%d", exit)
+	}
+	validateStackEnvelope(t, stdout)
+	var env struct {
+		Data struct {
+			Stack struct {
+				Name string `json:"name"`
+			} `json:"stack"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(stdout, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Data.Stack.Name != "s" {
+		t.Fatalf("delete response must name the removed stack: %+v", env.Data.Stack)
+	}
+
+	// Deleting again reports not found.
+	exit, stdout, _ = runStack(t, h, "--json", "--no-input", "--yes", "stack", "delete", "s")
+	if exit == 0 {
+		t.Fatal("deleting a missing stack must fail")
+	}
+	if msg := machineErrorMessage(t, stdout); !bytes.Contains([]byte(msg), []byte("no stack named")) {
+		t.Fatalf("missing delete must mention 'no stack named': %q", msg)
+	}
+}

@@ -26,7 +26,9 @@ const (
 	CommandHistoryPrune    CommandName = "history.prune"
 	CommandStackCreate     CommandName = "stack.create"
 	CommandStackAdd        CommandName = "stack.add"
+	CommandStackRemove     CommandName = "stack.remove"
 	CommandStackList       CommandName = "stack.list"
+	CommandStackDelete     CommandName = "stack.delete"
 	CommandUnknown         CommandName = "unknown"
 )
 
@@ -97,7 +99,9 @@ Commands:
   history alias|prune ...
   stack create <name>
   stack add <name> <iid> [<iid>...]
+  stack remove <name> <iid> [<iid>...]
   stack list [--all]
+  stack delete <name>
 
 Global options:
   --json  --no-input  --yes  --remote <name>
@@ -667,7 +671,7 @@ func parseHistoryPrune(args []string, inv *Invocation) error {
 
 func parseStack(args []string, inv *Invocation) error {
 	if len(args) == 0 {
-		return Invalid("invalid_arguments", "stack requires a subcommand: create, add, or list")
+		return Invalid("invalid_arguments", "stack requires a subcommand: create, add, remove, list, or delete")
 	}
 	switch args[0] {
 	case "create":
@@ -676,9 +680,15 @@ func parseStack(args []string, inv *Invocation) error {
 	case "add":
 		inv.Name = CommandStackAdd
 		return parseStackAdd(args[1:], inv)
+	case "remove":
+		inv.Name = CommandStackRemove
+		return parseStackAdd(args[1:], inv) // remove shares add's <name> <iid>... shape
 	case "list":
 		inv.Name = CommandStackList
 		return parseStackList(args[1:], inv)
+	case "delete":
+		inv.Name = CommandStackDelete
+		return parseStackCreate(args[1:], inv) // delete shares create's single-<name> shape
 	default:
 		inv.Name = CommandUnknown
 		return Invalid("unknown_command", fmt.Sprintf("unknown stack subcommand %q", args[0]))
@@ -744,7 +754,7 @@ func parseStackList(args []string, inv *Invocation) error {
 func mutationNeedsYes(name CommandName) bool {
 	switch name {
 	case CommandRestackStart, CommandRestackContinue, CommandRestackAbort,
-		CommandHistoryPrune:
+		CommandHistoryPrune, CommandStackDelete:
 		return true
 	default:
 		return false
@@ -798,8 +808,12 @@ func commandNameFromArgs(args []string) CommandName {
 				return CommandStackCreate
 			case "add":
 				return CommandStackAdd
+			case "remove":
+				return CommandStackRemove
 			case "list":
 				return CommandStackList
+			case "delete":
+				return CommandStackDelete
 			}
 		}
 		return CommandUnknown

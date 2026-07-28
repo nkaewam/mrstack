@@ -20,7 +20,9 @@ const (
 	CommandHistoryPrune    CommandName = "history.prune"
 	CommandStackCreate     CommandName = "stack.create"
 	CommandStackAdd        CommandName = "stack.add"
+	CommandStackRemove     CommandName = "stack.remove"
 	CommandStackList       CommandName = "stack.list"
+	CommandStackDelete     CommandName = "stack.delete"
 	CommandUnknown         CommandName = "unknown"
 )
 

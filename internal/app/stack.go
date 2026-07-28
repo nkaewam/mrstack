@@ -97,6 +97,64 @@ func (h *Handler) stackAdd(ctx context.Context, inv cli.Invocation) (cli.Result,
 		stack.Name, len(stack.MemberIIDs), stack.MemberIIDs))
 }
 
+func (h *Handler) stackRemove(ctx context.Context, inv cli.Invocation) (cli.Result, error) {
+	store, err := h.stackStore()
+	if err != nil {
+		return cli.Result{}, err
+	}
+	stack, err := store.RemoveMembers(inv.StackName, inv.MemberIIDs, h.nowStamp())
+	switch {
+	case errors.Is(err, stackstore.ErrNotFound):
+		return cli.Result{}, cli.Invalid("invalid_selector",
+			fmt.Sprintf("no stack named %q", inv.StackName))
+	case errors.Is(err, stackstore.ErrInvalidName):
+		return cli.Result{}, cli.Invalid("invalid_arguments",
+			fmt.Sprintf("invalid stack name %q", inv.StackName))
+	case err != nil:
+		return cli.Result{}, cli.Unavailable("stackstore_unavailable",
+			"cannot update stack: "+err.Error(), false)
+	}
+	env, _, err := h.envelope(inv.Name)
+	if err != nil {
+		return cli.Result{}, cli.Internal("cannot create response envelope", err)
+	}
+	env.Data["stack"] = toStackData(stack)
+	return result(env, fmt.Sprintf("Stack %q now has %d member(s): %v",
+		stack.Name, len(stack.MemberIIDs), stack.MemberIIDs))
+}
+
+func (h *Handler) stackDelete(ctx context.Context, inv cli.Invocation) (cli.Result, error) {
+	store, err := h.stackStore()
+	if err != nil {
+		return cli.Result{}, err
+	}
+	// Snapshot the stack before deletion so the response describes what was
+	// removed even though the file no longer exists.
+	stack, err := store.Get(inv.StackName)
+	switch {
+	case errors.Is(err, stackstore.ErrNotFound):
+		return cli.Result{}, cli.Invalid("invalid_selector",
+			fmt.Sprintf("no stack named %q", inv.StackName))
+	case errors.Is(err, stackstore.ErrInvalidName):
+		return cli.Result{}, cli.Invalid("invalid_arguments",
+			fmt.Sprintf("invalid stack name %q", inv.StackName))
+	case err != nil:
+		return cli.Result{}, cli.Unavailable("stackstore_unavailable",
+			"cannot read stack: "+err.Error(), false)
+	}
+	if err := store.Delete(inv.StackName); err != nil {
+		return cli.Result{}, cli.Unavailable("stackstore_unavailable",
+			"cannot delete stack: "+err.Error(), false)
+	}
+	env, _, err := h.envelope(inv.Name)
+	if err != nil {
+		return cli.Result{}, cli.Internal("cannot create response envelope", err)
+	}
+	env.Data["stack"] = toStackData(stack)
+	return result(env, fmt.Sprintf("Deleted stack %q (had %d member(s))",
+		stack.Name, len(stack.MemberIIDs)))
+}
+
 func (h *Handler) stackList(ctx context.Context, inv cli.Invocation) (cli.Result, error) {
 	store, err := h.stackStore()
 	if err != nil {
