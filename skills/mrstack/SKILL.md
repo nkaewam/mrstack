@@ -1,30 +1,30 @@
 ---
 name: mrstack
 description: >-
-  Drive the `mrstack` CLI to discover, check, and safely restack a linear chain
-  of dependent GitLab merge requests. Use when the user works with a GitLab MR
-  stack/chain (each MR targets the previous branch), mentions restacking or
-  rebasing a stack of merge requests, needs stack health/CI evidence, or asks
-  to fix "needs_restack"/stale ancestry across dependent MRs. Also use when an
-  agent must operate `mrstack` in machine mode (`--json --no-input`).
+  Drive the `mrstack` CLI to check and safely restack user-curated linear GitLab
+  MR stacks. Use when working with a GitLab MR stack/chain (each MR targets the
+  previous branch), managing named stacks (`stack create/add/list`), checking
+  stack health/CI, restacking after base movement, or fixing stale ancestry.
+  Also use when an agent must operate `mrstack` in machine mode (`--json --no-input`).
 license: MIT
 compatibility: >-
   Requires the `mrstack` binary on PATH, `git`, and an authenticated `glab`
   (GitLab CLI). Run inside a Git clone or worktree of the GitLab project.
 metadata:
   author: nkaewam
-  version: "0.2.1"
+  version: "0.3.0"
   source: https://github.com/nkaewam/mrstack
   schema: https://github.com/nkaewam/mrstack/blob/main/docs/schema/mrstack-v1.schema.json
 ---
 
 # mrstack
 
-`mrstack` discovers a linear stack of GitLab merge requests from live MR
-source/target relationships, reports stack health with exact CI evidence, and
-safely restacks stale branches by replaying only the affected suffix onto an
-isolated worktree, then publishing all rewritten refs with one atomic leased
-push. It never merges, never silently resolves conflicts, and never guesses
+`mrstack` checks and safely restacks **user-curated** linear stacks of GitLab
+merge requests. You register stack membership once (`stack create` / `stack add`);
+`check` and `view` derive chain order from live GitLab source/target
+relationships at read time. Restack replays only the affected suffix in an
+isolated worktree and publishes rewritten refs with one atomic leased push per
+branch. It never merges, never silently resolves conflicts, and never guesses
 after an uncertain push.
 
 A stack looks like:
@@ -34,15 +34,18 @@ main <── feature-a <── feature-b <── feature-c
          MR !101        MR !102        MR !103
 ```
 
-The first MR (the **front**) targets the default branch; every successor
-targets its predecessor's source branch. v1 supports one chain of 1–10 MRs in
-one project, no forks/cycles/cross-project.
+Register it as a **named stack** (e.g. `web-migration`) with IIDs `101 102 103`.
+The first MR (the **front**) targets the default branch; every successor targets
+its predecessor's source branch. v1 supports one chain of 1–10 open MRs in one
+project, no forks/cycles/cross-project.
 
 ## When to use this skill
 
 Activate when the task involves a GitLab MR stack and any of:
 
+- creating or editing named stack membership;
 - checking stack health / alignment / CI;
+- viewing stack status (live or cached);
 - restacking after `main` or an earlier branch moved;
 - interpreting `mrstack` JSON output (dispositions, findings, remediations);
 - recovering a paused restack (conflict, empty commit, crash, indeterminate push);
@@ -75,6 +78,29 @@ mrstack doctor
 capabilities may legitimately be `unverified`; a later mutation blocked by a
 known prerequisite exits `3` (`prerequisite_unsupported`).
 
+## Named stacks
+
+Stacks are persisted under `~/.mrstack/stacks/<name>.json`, bound to the GitLab
+host/project where they were created. Stack names are lowercase letters, digits,
+and hyphens (1–64 chars).
+
+```bash
+# from a clone of the target project
+mrstack stack create web-migration
+mrstack stack add web-migration 101 102 103
+mrstack stack list
+mrstack stack remove web-migration 101   # drop one IID
+mrstack stack delete web-migration      # requires --yes in machine mode
+```
+
+`stack list --all` shows stacks across every project. Membership is only IIDs;
+order is derived at `check`/`view` time from MR target/source branches.
+
+**Legacy integrated-predecessor stacks:** when the front MR targets a merged
+predecessor branch, include the merged predecessor's IID in the named stack so
+`check` can fetch integration evidence, even though only open MRs form the
+active component.
+
 ## Agent operating mode
 
 Agents and scripts always use machine mode. Both flags are required together:
@@ -86,11 +112,11 @@ mrstack --json --no-input [--remote origin] <command>
 Every invocation emits exactly one `mrstack/v1` JSON document on stdout
 (including failures). Diagnostics go to stderr; there are no prompts.
 
-**Mutations** (restack, continue, abort, history prune) additionally require
-`--yes`:
+**Mutations** (`stack delete`, `restack`, `continue`, `abort`, `history prune`)
+additionally require `--yes`:
 
 ```bash
-mrstack --json --no-input --yes --remote origin restack 102 --snapshot <id>
+mrstack --json --no-input --yes --remote origin restack --snapshot <id>
 ```
 
 Keep `--remote` explicit in automation and multi-remote repos.
@@ -109,23 +135,35 @@ and `.findings[].code`, not on the exit code alone.
 
 ## Core loop
 
-### 1. Check and capture a snapshot
+### 1. Register (once per stack)
 
 ```bash
-mrstack --json --no-input --remote origin check 102 > /tmp/check.json
+mrstack --json --no-input --remote origin stack create web-migration
+mrstack --json --no-input stack add web-migration 101 102 103
 ```
 
-Select a stack by current branch, MR IID, or branch name: `check`, `check 102`,
-`check feature-b`, or `check --stack <stack-id>`.
+### 2. Check and capture a snapshot
+
+```bash
+mrstack --json --no-input --remote origin check web-migration > /tmp/check.json
+```
+
+`check` requires a **named stack** (`check <name>`) or tracked completion
+reconciliation (`check --stack <stack-id>`). Bare `check`, MR IID, and branch
+autodiscovery are not supported.
 
 From the result, read:
 
 - `.disposition` — the one control-flow classification (see table below);
 - `.stack.snapshot_id` — **opaque, single-use** identity for the next mutation;
+- `.stack.selector` — `{ "kind": "named_stack", "value": "<name>" }` for curated stacks;
 - `.findings` — typed conditions with stable `code`s;
 - `.remediations[].actions[]` — executable transitions as literal `argv` arrays.
 
-### 2. Interpret the disposition
+A successful `check <name>` also writes a view cache at
+`~/.mrstack/view/<name>.json` for offline `view --all`.
+
+### 3. Interpret the disposition
 
 | Disposition | Agent action |
 |---|---|
@@ -139,7 +177,7 @@ From the result, read:
 Precedence when multiple findings coexist:
 `invalid > action_required > human_required > waiting > ready > complete`.
 
-### 3. Execute a remediation action (if `action_required`)
+### 4. Execute a remediation action (if `action_required`)
 
 Each `actions[]` object contains a literal `argv` array, an explicit `cwd`,
 `mutates`/`confirmation_required` flags, `preconditions`, and `requires`
@@ -157,30 +195,49 @@ Each `actions[]` object contains a literal `argv` array, an explicit `cwd`,
   unsafe for mutation.
 - Reuse the exact `snapshot_id` / `session_id` / `plan_id` from the packet that
   produced them. Never substitute a new ID into an old remediation. If
-  `remote_changed`, discard the stale packet and run a fresh `check`.
+  `remote_changed`, discard the stale packet and run a fresh `check <name>`.
+- `recheck` actions run `check <stack-name>` — use the stack name from
+  `.stack.selector.value` when `kind` is `named_stack`.
 
 Common action kinds: `start_restack`, `start_planned_restack`,
 `continue_restack`, `continue_drop_current`, `continue_keep_empty`,
 `abort_restack`, `recover_restack`, `fetch_ci_logs`, `recheck`.
 
-### 4. Recheck
+### 5. Recheck
 
-After any publication, retarget, or manual recovery, run a fresh `check` and
-use the new snapshot for any further mutation. Snapshot IDs are not reusable
-after the observed state changes.
+After any publication, retarget, or manual recovery, run a fresh check on the
+**same named stack** and use the new snapshot for any further mutation. Snapshot
+IDs are not reusable after the observed state changes.
+
+```bash
+mrstack --json --no-input --remote origin check web-migration
+```
+
+## View
+
+```bash
+mrstack view                          # live status for stacks in this repo
+mrstack view web-migration            # live status for one stack
+mrstack view --all                    # all stacks; cached status when available
+mrstack view --all --refresh          # live fetch across every project
+```
+
+Without `--refresh`, `view --all` shows membership plus the last `check`
+snapshot per stack (note includes `cached from <timestamp>`). Stacks never
+checked show membership only with a note to run `check <name>` or `--refresh`.
 
 ## Restack workflow
 
 ```bash
 # capture
-mrstack --json --no-input --remote origin check 102 > /tmp/check.json
+mrstack --json --no-input --remote origin check web-migration > /tmp/check.json
 SNAP=$(jq -r '.stack.snapshot_id' /tmp/check.json)
 
 # start (only if disposition == action_required and a start_restack action exists)
-mrstack --json --no-input --yes --remote origin restack 102 --snapshot "$SNAP"
+mrstack --json --no-input --yes --remote origin restack --snapshot "$SNAP"
 
 # after completion, recheck with a fresh snapshot
-mrstack --json --no-input --remote origin check 102
+mrstack --json --no-input --remote origin check web-migration
 ```
 
 `restack` revalidates the snapshot before replay and before push; rewrites
@@ -217,7 +274,7 @@ If GitLab/Git cannot establish one exact boundary, `mrstack` refuses to guess.
 Two-step manual plan:
 
 ```bash
-mrstack --json --no-input --remote origin restack plan 102 \
+mrstack --json --no-input --remote origin restack plan web-migration \
   --snapshot "$SNAP" --layer-boundary 102=<full-40-or-64-char-sha>
 # review data.plan, then:
 mrstack --json --no-input --yes --remote origin restack --plan <plan-id>
@@ -248,9 +305,12 @@ mrstack history alias --stack <id> <alias>   # display metadata only
 mrstack --json --no-input --yes history prune --before 720h [--stack <id>]
 ```
 
-History defaults to 50 observations (max 200). Pruning requires `--yes` in
-machine mode and never removes an unfinished session, active plan, tracked
-stack identity, or the newest observation for a tracked stack.
+History still accepts MR IID, branch, or `--stack <id>` selectors. Pruning
+requires `--yes` in machine mode and never removes an unfinished session, active
+plan, tracked stack identity, or the newest observation for a tracked stack.
+
+`check --stack <id>` reconciles a **fully merged** tracked stack from journal
+history; use it only for completion verification, not for live health checks.
 
 ## GitLab modes
 

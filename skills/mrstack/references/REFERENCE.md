@@ -7,7 +7,7 @@ against the [mrstack/v1 JSON Schema](https://github.com/nkaewam/mrstack/blob/mai
 
 ```text
 mrstack doctor
-mrstack check [<MR-or-branch> | --stack <id>]
+mrstack check <name> | --stack <id>
 mrstack restack [<MR-or-branch>] --snapshot <id> [--allow-signature-loss]
 mrstack restack plan [<MR-or-branch>] --snapshot <id> --layer-boundary <mr>=<sha>
 mrstack restack --plan <id> [--allow-signature-loss]
@@ -19,16 +19,27 @@ mrstack ci logs --pipeline <id> --job <id>... [--max-bytes <n>]
 mrstack history [<MR-or-branch> | --stack <id>] [--limit <n>] [--cursor <opaque>]
 mrstack history alias --stack <id> (<alias> | --clear)
 mrstack history prune --before <timestamp-or-duration> [--stack <id>]
+mrstack stack create <name>
+mrstack stack add <name> <iid> [<iid>...]
+mrstack stack remove <name> <iid> [<iid>...]
+mrstack stack list [--all]
+mrstack stack delete <name>
+mrstack view [<name>] [--all] [--refresh]
 ```
 
 Global options: `--remote <name>`, `--gitlab-mode auto|legacy|native`,
 `--json` (with `--no-input`), `--no-input` (with `--json`), `--yes` (mutations),
-`-h/--help`, `--version`.
+`--debug`, `-h/--help`, `--version`.
 
 Read-only commands: `doctor`, `check`, `ci logs`, `history`, `restack plan`,
-`restack recover`. History-rewriting: `restack` (start), `restack --plan`,
-`restack continue`. `restack abort` is available before remote publication.
-`restack abandon` is human-only (unavailable with `--no-input`).
+`restack recover`, `stack create`, `stack add`, `stack list`, `view` (without
+`--refresh` on `view --all`, cached status may be shown). History-rewriting:
+`restack` (start), `restack --plan`, `restack continue`, `stack delete`,
+`stack remove`, `history prune`. `restack abort` is available before remote
+publication. `restack abandon` is human-only (unavailable with `--no-input`).
+
+Named stacks persist under `~/.mrstack/stacks/`. View snapshots from the last
+successful `check <name>` persist under `~/.mrstack/view/`.
 
 ## Envelope
 
@@ -60,7 +71,8 @@ Every response has the same required top-level keys (inapplicable = `null`,
 
 Stable command names: `doctor`, `check`, `restack.start`, `restack.plan`,
 `restack.continue`, `restack.abort`, `restack.recover`, `restack.abandon`,
-`ci.logs`, `history.show`, `history.alias`, `history.prune`, `unknown`.
+`ci.logs`, `history.show`, `history.alias`, `history.prune`, `stack.create`,
+`stack.add`, `stack.remove`, `stack.list`, `stack.delete`, `view`, `unknown`.
 
 ### Outcome classes
 
@@ -181,6 +193,10 @@ and object fetches do not set it).
 | `fetch_ci_logs` | `pipeline_id`, non-empty `job_ids` | `pipeline_and_jobs_pinned` |
 | `recheck` | none | `repository_context_current` |
 
+`recheck` argv is always `mrstack --json --no-input --remote <name> check
+<stack-name>` where `<stack-name>` is the curated stack's `named_stack` selector
+value. Bare `check` is invalid.
+
 Every other identity in `requires` is null or an empty `job_ids` array. An
 unknown action `kind` or precondition is unsafe — do not invoke.
 
@@ -229,8 +245,11 @@ assessed.
 
 ## Selector and remote identity
 
-Selector kinds: `current_branch`, `branch`, `mr`, `tracked_stack`. Remote
-selection is `upstream` or `explicit`. Remote endpoints carry only canonical
+Selector kinds: `named_stack`, `tracked_stack`, `current_branch`, `branch`,
+`mr`. `check` accepts only `named_stack` (positional name) or `tracked_stack`
+(`--stack <id>` for merged-stack completion). History and restack plan still
+accept legacy `branch`/`mr`/`current_branch` selectors where documented.
+Remote selection is `upstream` or `explicit`. Remote endpoints carry only canonical
 host/project identity — never schemes, usernames, embedded credentials, or raw
 config URLs. Project/pipeline/job IDs are decimal strings; MR IIDs and member
 positions are JSON integers. A mutation snapshot binds the GitLab project, the
