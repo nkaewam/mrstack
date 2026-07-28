@@ -328,6 +328,67 @@
             "properties": {
               "name": {
                 "enum": [
+                  "stack.create",
+                  "stack.add"
+                ]
+              }
+            }
+          },
+          "outcome": {
+            "properties": {
+              "class": {
+                "const": "authoritative"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "required": [
+              "stack"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "command": {
+            "properties": {
+              "name": {
+                "const": "stack.list"
+              }
+            }
+          },
+          "outcome": {
+            "properties": {
+              "class": {
+                "const": "authoritative"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "required": [
+              "stacks"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "command": {
+            "properties": {
+              "name": {
+                "enum": [
                   "restack.abandon",
                   "unknown"
                 ]
@@ -500,6 +561,9 @@
             "history.show",
             "history.alias",
             "history.prune",
+            "stack.create",
+            "stack.add",
+            "stack.list",
             "unknown"
           ]
         },
@@ -3302,6 +3366,48 @@
       },
       "additionalProperties": true
     },
+    "stackData": {
+      "type": "object",
+      "required": [
+        "name",
+        "host",
+        "project",
+        "member_iids",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$|^[a-z0-9]$"
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project": {
+          "type": "string",
+          "minLength": 1
+        },
+        "member_iids": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "uniqueItems": true
+        },
+        "created_at": {
+          "$ref": "#/$defs/utcTimestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/utcTimestamp"
+        }
+      },
+      "additionalProperties": true
+    },
     "logRequest": {
       "type": "object",
       "required": [
@@ -3429,6 +3535,15 @@
         },
         "history_prune": {
           "$ref": "#/$defs/historyPruneData"
+        },
+        "stack": {
+          "$ref": "#/$defs/stackData"
+        },
+        "stacks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stackData"
+          }
         },
         "log_request": {
           "$ref": "#/$defs/logRequest"

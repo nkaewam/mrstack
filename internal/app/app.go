@@ -27,11 +27,12 @@ import (
 // exported so tests and embedding callers can provide an argv-recording
 // transport without replacing production behavior.
 type Handler struct {
-	Runner   gitexec.CommandRunner
-	Dir      string
-	StateDir string
-	Stderr   io.Writer
-	Now      func() time.Time
+	Runner    gitexec.CommandRunner
+	Dir       string
+	StateDir  string
+	StacksDir string
+	Stderr    io.Writer
+	Now       func() time.Time
 	// Failpoint is an optional deterministic crash-boundary hook used by
 	// mechanical recovery tests. Production handlers leave it nil.
 	Failpoint  func(string) error
@@ -69,6 +70,12 @@ func (h *Handler) Dispatch(ctx context.Context, inv cli.Invocation) (cli.Result,
 		return h.historyAlias(ctx, inv)
 	case cli.CommandHistoryPrune:
 		return h.historyPrune(ctx, inv)
+	case cli.CommandStackCreate:
+		return h.stackCreate(ctx, inv)
+	case cli.CommandStackAdd:
+		return h.stackAdd(ctx, inv)
+	case cli.CommandStackList:
+		return h.stackList(ctx, inv)
 	case cli.CommandRestackAbandon:
 		return h.restackAbandon(ctx, inv)
 	default:

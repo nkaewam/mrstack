@@ -837,6 +837,18 @@ func validateCommandData(e Envelope) error {
 		return typeOK("history_alias", HistoryAliasData{})
 	case CommandHistoryPrune:
 		return typeOK("history_prune", HistoryPruneData{})
+	case CommandStackCreate:
+		if err := typeOK("stack", StackData{}); err != nil {
+			return err
+		}
+		return validateStackData(e.Data["stack"].(StackData))
+	case CommandStackAdd:
+		if err := typeOK("stack", StackData{}); err != nil {
+			return err
+		}
+		return validateStackData(e.Data["stack"].(StackData))
+	case CommandStackList:
+		return typeOK("stacks", []StackData{})
 	case CommandCILogs:
 		if err := typeOK("log_request", LogRequest{}); err != nil {
 			return err
@@ -920,6 +932,24 @@ func validateDoctorData(data DoctorData) error {
 			return fmt.Errorf("api: invalid doctor capability %q", capability.Name)
 		}
 		required[capability.Name] = true
+	}
+	return nil
+}
+
+// validateStackData enforces the published invariants of a named stack:
+// non-empty identity, a bound project, and unique positive member IIDs.
+func validateStackData(data StackData) error {
+	if strings.TrimSpace(data.Name) == "" ||
+		strings.TrimSpace(data.Host) == "" ||
+		strings.TrimSpace(data.Project) == "" {
+		return errors.New("api: stack requires name, host, and project")
+	}
+	seen := map[int]bool{}
+	for _, iid := range data.MemberIIDs {
+		if iid <= 0 || seen[iid] {
+			return fmt.Errorf("api: stack %q has duplicate or non-positive member IID %d", data.Name, iid)
+		}
+		seen[iid] = true
 	}
 	return nil
 }
@@ -1073,7 +1103,8 @@ func validCommand(name CommandName) bool {
 	case CommandDoctor, CommandCheck, CommandRestackStart, CommandRestackPlan,
 		CommandRestackContinue, CommandRestackAbort, CommandRestackRecover,
 		CommandRestackAbandon, CommandCILogs, CommandHistoryShow,
-		CommandHistoryAlias, CommandHistoryPrune, CommandUnknown:
+		CommandHistoryAlias, CommandHistoryPrune,
+		CommandStackCreate, CommandStackAdd, CommandStackList, CommandUnknown:
 		return true
 	default:
 		return false

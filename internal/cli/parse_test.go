@@ -68,6 +68,21 @@ func TestParseEveryDocumentedCommand(t *testing.T) {
 		{"history prune", []string{"history", "prune", "--before", "30d", "--stack", "stk_1"}, CommandHistoryPrune, func(t *testing.T, i Invocation) {
 			equal(t, i.Before, "30d")
 		}},
+		{"stack create", []string{"stack", "create", "web-migration"}, CommandStackCreate, func(t *testing.T, i Invocation) {
+			equal(t, i.StackName, "web-migration")
+		}},
+		{"stack add", []string{"stack", "add", "web-migration", "3061", "3062"}, CommandStackAdd, func(t *testing.T, i Invocation) {
+			equal(t, i.StackName, "web-migration")
+			equal(t, len(i.MemberIIDs), 2)
+			equal(t, i.MemberIIDs[0], 3061)
+			equal(t, i.MemberIIDs[1], 3062)
+		}},
+		{"stack list", []string{"stack", "list"}, CommandStackList, nil},
+		{"stack list all", []string{"stack", "list", "--all"}, CommandStackList, func(t *testing.T, i Invocation) {
+			if !i.AllStacks {
+				t.Fatal("--all not parsed")
+			}
+		}},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -219,6 +234,14 @@ func TestInvalidInvocations(t *testing.T) {
 		{"machine prune yes", []string{"history", "prune", "--before", "1d", "--json", "--no-input"}, "invalid_arguments"},
 		{"human-only help machine", []string{"--help", "--json", "--no-input"}, "invalid_arguments"},
 		{"empty option value", []string{"check", "--stack="}, "invalid_arguments"},
+		{"stack no subcommand", []string{"stack"}, "invalid_arguments"},
+		{"stack unknown subcommand", []string{"stack", "frobnicate"}, "unknown_command"},
+		{"stack create no name", []string{"stack", "create"}, "invalid_arguments"},
+		{"stack create extra", []string{"stack", "create", "a", "b"}, "invalid_arguments"},
+		{"stack add no iid", []string{"stack", "add", "s"}, "invalid_arguments"},
+		{"stack add bad iid", []string{"stack", "add", "s", "0"}, "invalid_arguments"},
+		{"stack add non-numeric", []string{"stack", "add", "s", "abc"}, "invalid_arguments"},
+		{"stack list unknown flag", []string{"stack", "list", "--bogus"}, "invalid_arguments"},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -252,6 +275,10 @@ func TestMachineMutationsAcceptYesAndReadOnlyCommandsDoNotRequireIt(t *testing.T
 		{"restack", "plan", "--snapshot", "s", "--layer-boundary", "1=" + sha, "--json", "--no-input"},
 		{"restack", "recover", "--session", "s", "--json", "--no-input"},
 		{"history", "alias", "--stack", "s", "--clear", "--json", "--no-input"},
+		{"stack", "create", "web-migration", "--json", "--no-input"},
+		{"stack", "add", "web-migration", "3061", "--json", "--no-input"},
+		{"stack", "list", "--json", "--no-input"},
+		{"stack", "list", "--all", "--json", "--no-input"},
 	}
 	for _, args := range valid {
 		if _, err := Parse(args); err != nil {

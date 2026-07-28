@@ -18,6 +18,9 @@ const (
 	CommandHistoryShow     CommandName = "history.show"
 	CommandHistoryAlias    CommandName = "history.alias"
 	CommandHistoryPrune    CommandName = "history.prune"
+	CommandStackCreate     CommandName = "stack.create"
+	CommandStackAdd        CommandName = "stack.add"
+	CommandStackList       CommandName = "stack.list"
 	CommandUnknown         CommandName = "unknown"
 )
 
@@ -409,6 +412,18 @@ type HistoryPruneData struct {
 	DeletedObservations int     `json:"deleted_observations"`
 	DeletedEvidence     int     `json:"deleted_evidence"`
 	PreservedRecords    int     `json:"preserved_records"`
+}
+
+// StackData is the published shape of a user-curated named stack. It mirrors
+// internal/stackstore.Stack so the transport layer never exposes the store
+// type directly.
+type StackData struct {
+	Name       string `json:"name"`
+	Host       string `json:"host"`
+	Project    string `json:"project"`
+	MemberIIDs []int  `json:"member_iids"`
+	CreatedAt  string `json:"created_at"`
+	UpdatedAt  string `json:"updated_at"`
 }
 
 type LogRequest struct {

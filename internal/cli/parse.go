@@ -24,6 +24,9 @@ const (
 	CommandHistoryShow     CommandName = "history.show"
 	CommandHistoryAlias    CommandName = "history.alias"
 	CommandHistoryPrune    CommandName = "history.prune"
+	CommandStackCreate     CommandName = "stack.create"
+	CommandStackAdd        CommandName = "stack.add"
+	CommandStackList       CommandName = "stack.list"
 	CommandUnknown         CommandName = "unknown"
 )
 
@@ -63,6 +66,13 @@ type Invocation struct {
 	AcceptCurrentRemote bool
 	Help                bool
 	ShowVersion         bool
+
+	// Stack management: name of the named stack under management, and the
+	// member MR IIDs being added. AllStacks selects the cross-project view
+	// for `stack list`.
+	StackName  string
+	MemberIIDs []int
+	AllStacks  bool
 }
 
 type LayerBoundary struct {
@@ -85,6 +95,9 @@ Commands:
   ci logs --pipeline <id> --job <id>...
   history [<MR-or-branch> | --stack <id>]
   history alias|prune ...
+  stack create <name>
+  stack add <name> <iid> [<iid>...]
+  stack list [--all]
 
 Global options:
   --json  --no-input  --yes  --remote <name>
@@ -142,6 +155,8 @@ func Parse(args []string) (Invocation, error) {
 		err = parseCI(clean[1:], &inv)
 	case "history":
 		err = parseHistory(clean[1:], &inv)
+	case "stack":
+		err = parseStack(clean[1:], &inv)
 	default:
 		inv.Name = CommandUnknown
 		err = Invalid("unknown_command", fmt.Sprintf("unknown command %q", clean[0]))
@@ -650,6 +665,82 @@ func parseHistoryPrune(args []string, inv *Invocation) error {
 	return nil
 }
 
+func parseStack(args []string, inv *Invocation) error {
+	if len(args) == 0 {
+		return Invalid("invalid_arguments", "stack requires a subcommand: create, add, or list")
+	}
+	switch args[0] {
+	case "create":
+		inv.Name = CommandStackCreate
+		return parseStackCreate(args[1:], inv)
+	case "add":
+		inv.Name = CommandStackAdd
+		return parseStackAdd(args[1:], inv)
+	case "list":
+		inv.Name = CommandStackList
+		return parseStackList(args[1:], inv)
+	default:
+		inv.Name = CommandUnknown
+		return Invalid("unknown_command", fmt.Sprintf("unknown stack subcommand %q", args[0]))
+	}
+}
+
+// parseStackCreate accepts exactly one positional: the stack name. The host
+// and project are resolved from the current repository at execution time.
+func parseStackCreate(args []string, inv *Invocation) error {
+	var positionals []string
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			return unknownOption(arg)
+		}
+		positionals = append(positionals, arg)
+	}
+	if len(positionals) != 1 {
+		return Invalid("invalid_arguments", "stack create requires exactly one argument: the stack name")
+	}
+	inv.StackName = positionals[0]
+	return nil
+}
+
+// parseStackAdd accepts a stack name followed by one or more positive MR IIDs.
+func parseStackAdd(args []string, inv *Invocation) error {
+	var positionals []string
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			return unknownOption(arg)
+		}
+		positionals = append(positionals, arg)
+	}
+	if len(positionals) < 2 {
+		return Invalid("invalid_arguments", "stack add requires a stack name and at least one MR IID")
+	}
+	inv.StackName = positionals[0]
+	iids := make([]int, 0, len(positionals)-1)
+	for _, raw := range positionals[1:] {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			return Invalid("invalid_arguments", fmt.Sprintf("invalid MR IID %q: must be a positive integer", raw))
+		}
+		iids = append(iids, n)
+	}
+	inv.MemberIIDs = iids
+	return nil
+}
+
+// parseStackList takes an optional --all flag; without it the result is scoped
+// to the current repository's project.
+func parseStackList(args []string, inv *Invocation) error {
+	for _, arg := range args {
+		switch arg {
+		case "--all":
+			inv.AllStacks = true
+		default:
+			return unknownOption(arg)
+		}
+	}
+	return nil
+}
+
 func mutationNeedsYes(name CommandName) bool {
 	switch name {
 	case CommandRestackStart, CommandRestackContinue, CommandRestackAbort,
@@ -700,6 +791,18 @@ func commandNameFromArgs(args []string) CommandName {
 			}
 		}
 		return CommandHistoryShow
+	case "stack":
+		if len(clean) > 1 {
+			switch clean[1] {
+			case "create":
+				return CommandStackCreate
+			case "add":
+				return CommandStackAdd
+			case "list":
+				return CommandStackList
+			}
+		}
+		return CommandUnknown
 	}
 	return CommandUnknown
 }
