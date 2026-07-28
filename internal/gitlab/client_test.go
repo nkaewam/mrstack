@@ -101,8 +101,8 @@ func TestIDsAreValidatedBeforeGlab(t *testing.T) {
 	if _, err := client.Pipeline(context.Background(), "1", "bad"); err == nil {
 		t.Fatal("unsafe pipeline ID accepted")
 	}
-	if _, err := client.PipelineMergeRequests(context.Background(), "1", "-2"); err == nil {
-		t.Fatal("unsafe pipeline association ID accepted")
+	if _, err := client.MergeRequestPipelines(context.Background(), "1", -2); err == nil {
+		t.Fatal("unsafe merge request IID accepted")
 	}
 	if _, err := client.Commit(context.Background(), "1", "not-an-object-id"); err == nil {
 		t.Fatal("unsafe commit ID accepted")
@@ -120,13 +120,13 @@ func TestPipelineEvidenceTransportUsesTypedEndpoints(t *testing.T) {
 	if pipeline.ID.String() != "9" || pipeline.Source != "merge_request_event" {
 		t.Fatalf("pipeline evidence lost: %#v", pipeline)
 	}
-	runner.stdout = []byte(`[{"iid":7}]`)
-	associated, err := client.PipelineMergeRequests(context.Background(), "42", "9")
+	runner.stdout = []byte(`[{"id":9,"ref":"refs/merge-requests/7/merge"}]`)
+	pipelines, err := client.MergeRequestPipelines(context.Background(), "42", 7)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(associated) != 1 || associated[0].IID != 7 {
-		t.Fatalf("association evidence lost: %#v", associated)
+	if len(pipelines) != 1 || pipelines[0].ID.String() != "9" {
+		t.Fatalf("association evidence lost: %#v", pipelines)
 	}
 	runner.stdout = []byte(`{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","parent_ids":["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","cccccccccccccccccccccccccccccccccccccccc"]}`)
 	commit, err := client.Commit(context.Background(), "42", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -138,12 +138,13 @@ func TestPipelineEvidenceTransportUsesTypedEndpoints(t *testing.T) {
 	}
 	wantEndpoints := []string{
 		"/projects/42/pipelines/9",
-		"/projects/42/pipelines/9/merge_requests",
+		"/projects/42/merge_requests/7/pipelines?per_page=100",
 		"/projects/42/repository/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	}
 	for i, endpoint := range wantEndpoints {
-		if !reflect.DeepEqual(runner.calls[i], []string{"glab", "api", endpoint}) {
-			t.Fatalf("call %d=%#v want endpoint %q", i, runner.calls[i], endpoint)
+		got := runner.calls[i]
+		if len(got) < 3 || got[0] != "glab" || got[1] != "api" || got[2] != endpoint {
+			t.Fatalf("call %d=%#v want endpoint %q", i, got, endpoint)
 		}
 	}
 }
