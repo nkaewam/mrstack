@@ -72,6 +72,43 @@ tar -xzf "mrstack_${VERSION#v}_${os}_${arch}.tar.gz"
 install -m 0755 "mrstack_${VERSION#v}_${os}_${arch}/mrstack" /usr/local/bin/mrstack
 ```
 
+## Agent Skill
+
+`mrstack` ships an [Agent Skill](https://agentskills.io) that teaches any
+compatible coding agent (Cursor, Claude Code, OpenAI Codex, Gemini CLI, Goose,
+OpenCode, …) how to operate `mrstack` in machine mode — the check → restack →
+recheck loop, interpreting dispositions/findings, executing remediation
+actions verbatim, and honoring the safety invariants.
+
+### Install the skill
+
+One-liner (auto-detects the agent client):
+
+```sh
+curl -sSL https://raw.githubusercontent.com/nkaewam/mrstack/main/skills/install.sh | bash
+```
+
+Or pin a client:
+
+```sh
+curl -sSL https://raw.githubusercontent.com/nkaewam/mrstack/main/skills/install.sh | bash -s -- --client claude
+```
+
+Supported clients: `cursor`, `claude`, `codex`, `opencode`, `goose`, `agents`.
+Run `./skills/install.sh --list` to see their install directories.
+
+### Manual install
+
+```sh
+git clone --depth 1 https://github.com/nkaewam/mrstack.git /tmp/mrstack
+cp -r /tmp/mrstack/skills/mrstack ~/.cursor/skills/   # or your client's dir
+rm -rf /tmp/mrstack
+```
+
+The skill lives at [`skills/mrstack/`](skills/mrstack/) and validates against
+the [Agent Skills spec](https://agentskills.io/specification.md) (`skills-ref
+validate skills/mrstack` → `Valid skill`).
+
 ## Quick start
 
 Go 1.24 or newer, Task 3, `git`, and an authenticated `glab` are required.
