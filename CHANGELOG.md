@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/nkaewam/mrstack/compare/v0.2.0...v0.2.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* generate SBOM on host platform in release ([4a53ce0](https://github.com/nkaewam/mrstack/commit/4a53ce044b2326d451fc000229cc50d539f7a2fa))
+
 ## [0.2.0](https://github.com/nkaewam/mrstack/compare/v0.1.0...v0.2.0) (2026-07-28)
 
 
