@@ -10,7 +10,7 @@ test -z "$(gofmt -l .)"
 CGO_ENABLED=0 go build -trimpath ./cmd/mrstack
 ```
 
-`make test-all` runs the same local release gate.
+`task test-all` runs the same local release gate.
 
 ## Test layers
 

@@ -1,0 +1,37 @@
+version: "3"
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build a CGO-free local binary
+    cmds:
+      - mkdir -p bin
+      - CGO_ENABLED=0 go build -trimpath -o bin/mrstack ./cmd/mrstack
+
+  test:
+    desc: Run the unit, integration, contract, and CLI test suites
+    cmds:
+      - go test -shuffle=on -count=1 ./...
+
+  test-race:
+    desc: Run the complete test suite with the race detector
+    cmds:
+      - go test -race -shuffle=on -count=1 ./...
+
+  lint:
+    desc: Check formatting and run Go vet
+    cmds:
+      - test -z "$(gofmt -l .)"
+      - go vet ./...
+
+  test-all:
+    desc: Run the complete local release gate
+    cmds:
+      - task: lint
+      - task: test
+      - task: test-race
+      - task: build

@@ -1,5 +1,9 @@
 # mrstack CLI
 
+For installation, concepts, walkthroughs, recovery procedures, and
+troubleshooting, start with the [user guide](USER-GUIDE.md). This document is
+the concise command-behavior contract.
+
 V1 commands must run inside a Git clone or worktree of the selected GitLab project. API-only `--repo` operation is outside the v1 interface.
 
 The global `--gitlab-mode auto|legacy|native` flag defaults to `auto`. A legacy or native override is required when the server version cannot be read. When it can be read, an explicit mode must match detection; a contradiction exits 2 `invalid_arguments` before observation or mutation.

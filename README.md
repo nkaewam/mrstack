@@ -1,14 +1,65 @@
 # mrstack
 
-`mrstack` is a Go CLI for discovering, checking, and safely restacking a strict linear chain of ordinary GitLab merge requests. It targets Agoda's GitLab 18.11 deployment while retaining useful restack, CI-evidence, history, and agent-integration behavior after GitLab 19.1 native stacks arrive.
+`mrstack` is a Go CLI for discovering, checking, and safely restacking a strict
+linear chain of ordinary GitLab merge requests. It targets Agoda's GitLab 18.11
+deployment while retaining useful restack, CI-evidence, history, and
+agent-integration behavior after GitLab 19.1 native stacks arrive.
 
-The repository contains the v1 implementation, its frozen machine-readable contract, deterministic fake-provider tests, real local-Git integration tests, and GitHub Actions CI/release automation.
+Given a chain such as:
 
-Canonical source: `github.com/nkaewam/mrstack`. CI/CD and release automation will use GitHub Actions; runtime GitLab access remains local through `glab`.
+```text
+main <── feature-a <── feature-b <── feature-c
+         MR !101        MR !102        MR !103
+```
+
+`mrstack` derives the chain from GitLab, checks exact ancestry and CI, rewrites
+only the stale suffix in an isolated worktree, and publishes every affected
+branch atomically with explicit leases. It never merges MRs, silently resolves
+conflicts, or guesses after an uncertain push.
+
+Start with the [complete user guide](docs/USER-GUIDE.md).
+
+Canonical source: `github.com/nkaewam/mrstack`. CI/CD and release automation
+use GitHub Actions; runtime GitLab access remains local through `glab`.
+
+## Quick start
+
+Go 1.24 or newer, Task 3, `git`, and an authenticated `glab` are required.
+
+```text
+task build
+cd /path/to/your/gitlab-project
+/path/to/mrstack/bin/mrstack doctor
+/path/to/mrstack/bin/mrstack check
+```
+
+Select a stack by current branch, MR IID, or branch name:
+
+```text
+mrstack check
+mrstack check 102
+mrstack check feature-b
+```
+
+If a check reports `needs_restack`, use the exact returned snapshot:
+
+```text
+mrstack restack 102 --snapshot <snapshot-id>
+```
+
+For agents and scripts, pair `--json` with `--no-input`; mutating commands also
+require `--yes`:
+
+```text
+mrstack --json --no-input --remote origin check 102
+mrstack --json --no-input --yes --remote origin \
+  restack 102 --snapshot <snapshot-id>
+```
 
 ## Design documents
 
 - [V1 design](docs/DESIGN.md)
+- [User guide](docs/USER-GUIDE.md)
 - [CLI contract](docs/CLI.md)
 - [Agent JSON API](docs/AGENT-API.md)
 - [Agent API JSON Schema](docs/schema/mrstack-v1.schema.json)
@@ -24,12 +75,10 @@ GitLab MR source and target branch relationships are the sole source of truth fo
 
 ## Build and test
 
-Go 1.24 or newer, `git`, and `glab` are required.
-
 ```text
-make build
-make test
-make test-race
+task build
+task test
+task test-race
 ```
 
 The binary is written to `bin/mrstack`. All GitLab access goes through the caller's existing `glab` authentication; `mrstack` does not store a GitLab token.
