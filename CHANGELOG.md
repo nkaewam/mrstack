@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.0](https://github.com/nkaewam/mrstack/compare/v0.2.1...v0.3.0) (2026-07-28)
+
+
+### Features
+
+* add check &lt;name&gt; to run the check pipeline on a named stack ([4694d27](https://github.com/nkaewam/mrstack/commit/4694d273b6f879a2e6c8f969e7adb2e716a9d3f9))
+* add mrstack agent skill and installer ([208cbe9](https://github.com/nkaewam/mrstack/commit/208cbe9fa75469e45d4134ab6206d602cb2837f9))
+* add mrstack view to render named stacks with live status ([6dd1bea](https://github.com/nkaewam/mrstack/commit/6dd1bea17f64381e08ddd51fb32ad60001ca0629))
+* add stack remove and stack delete for full named-stack management ([7edb137](https://github.com/nkaewam/mrstack/commit/7edb137dd2fb9bfccb4ad4b38488002a61a0670a))
+* add user-global named stacks with stack create/add/list ([29b6f4e](https://github.com/nkaewam/mrstack/commit/29b6f4e39f606dd399f33ea4aaf17b81de18975c))
+* require named stacks for check and cache view snapshots ([e41673f](https://github.com/nkaewam/mrstack/commit/e41673f3dd2b7bbc5ed4bb48cd46bd1ebd4d371b))
+
+
+### Bug Fixes
+
+* clean up managed git worktrees in restack tests ([d34dc74](https://github.com/nkaewam/mrstack/commit/d34dc74f9571d23c4234df98c739329c91875765))
+* decode paginated glab array responses and surface transport errors ([9bc0444](https://github.com/nkaewam/mrstack/commit/9bc0444f55b6a8564b1a0dd9224eb10b2576b608))
+* satisfy staticcheck S1009 in gitlab client test ([2bdac09](https://github.com/nkaewam/mrstack/commit/2bdac0913171340c2eae46ef60155badcf717b9e))
+* use Vercel skills CLI instead of custom install.sh ([90f8568](https://github.com/nkaewam/mrstack/commit/90f856895bfcd91b6acc4841fa30499d8c961b25))
+* validate Homebrew formula component order on release ([462bf99](https://github.com/nkaewam/mrstack/commit/462bf990cc58f425aee627c40e7aed5aff65627e))
+
 ## [0.2.1](https://github.com/nkaewam/mrstack/compare/v0.2.0...v0.2.1) (2026-07-28)
 
 
