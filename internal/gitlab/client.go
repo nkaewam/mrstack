@@ -4,10 +4,12 @@
 package gitlab
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strconv"
 	"strings"
@@ -43,6 +45,82 @@ func (c Client) api(ctx context.Context, endpoint string, out any, args ...strin
 		return fmt.Errorf("decode GitLab response for %s: %w", endpoint, err)
 	}
 	return nil
+}
+
+// apiArray fetches a paginated REST array endpoint via `glab api --paginate`
+// and decodes the result with a streaming decoder.
+//
+// glab's default JSON output mode does not merge paginated REST array
+// responses into a single array: it concatenates the raw response bodies
+// back-to-back with no separator, so a multi-page array endpoint yields
+// "[{...page1...}][{...page2...}]", which is not a valid single JSON document
+// and causes json.Unmarshal to fail. This is silent for small repos (one
+// page) but breaks discovery on projects with many merge requests.
+//
+// decodeArrayStream tolerates three shapes so the transport is robust across
+// glab versions and output modes: a single JSON array, concatenated JSON
+// arrays, and newline-delimited JSON objects.
+func apiArray[T any](c Client, ctx context.Context, endpoint string) ([]T, error) {
+	if c.Runner == nil {
+		c.Runner = gitexec.ExecRunner{}
+	}
+	if endpoint == "" || !strings.HasPrefix(endpoint, "/") ||
+		strings.ContainsAny(endpoint, "\x00\n\r") {
+		return nil, errors.New("unsafe GitLab endpoint")
+	}
+	argv := []string{"api"}
+	if c.Host != "" {
+		argv = append(argv, "--hostname", c.Host)
+	}
+	argv = append(argv, endpoint, "--paginate")
+	result, err := c.Runner.Run(ctx, c.Dir, "glab", argv...)
+	if err != nil {
+		return nil, err
+	}
+	items, err := decodeArrayStream[T](result.Stdout)
+	if err != nil {
+		return nil, fmt.Errorf("decode GitLab response for %s: %w", endpoint, err)
+	}
+	return items, nil
+}
+
+// decodeArrayStream decodes a sequence of JSON values into a flat slice. Each
+// value may be a JSON array (its elements are appended) or a single JSON
+// object (appended as one element). This handles glab's concatenated
+// multi-page array output as well as NDJSON streams.
+func decodeArrayStream[T any](data []byte) ([]T, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var all []T
+	for {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) == 0 {
+			continue
+		}
+		switch trimmed[0] {
+		case '[':
+			var batch []T
+			if err := json.Unmarshal(raw, &batch); err != nil {
+				return nil, err
+			}
+			all = append(all, batch...)
+		case '{':
+			var item T
+			if err := json.Unmarshal(raw, &item); err != nil {
+				return nil, err
+			}
+			all = append(all, item)
+		default:
+			return nil, fmt.Errorf("unexpected JSON token %q at start of array element", trimmed[0])
+		}
+	}
+	return all, nil
 }
 
 type Version struct {
@@ -141,9 +219,8 @@ func (c Client) MergeRequests(ctx context.Context, projectID, state string) ([]M
 	default:
 		return nil, errors.New("unsupported merge request state")
 	}
-	var requests []MergeRequest
-	err = c.api(ctx, prefix+"/merge_requests?state="+state+"&scope=all&per_page=100", &requests, "--paginate")
-	return requests, err
+	endpoint := prefix + "/merge_requests?state=" + state + "&scope=all&per_page=100"
+	return apiArray[MergeRequest](c, ctx, endpoint)
 }
 
 func (c Client) MergeRequest(ctx context.Context, projectID string, iid int) (MergeRequest, error) {
@@ -275,9 +352,7 @@ func (c Client) PipelineJobs(ctx context.Context, projectID, pipelineID string) 
 	if !validDecimalID(pipelineID) {
 		return nil, errors.New("pipeline ID must be decimal")
 	}
-	var jobs []Job
-	err = c.api(ctx, prefix+"/pipelines/"+pipelineID+"/jobs?per_page=100", &jobs, "--paginate")
-	return jobs, err
+	return apiArray[Job](c, ctx, prefix+"/pipelines/"+pipelineID+"/jobs?per_page=100")
 }
 
 func (c Client) JobTrace(ctx context.Context, projectID, jobID string) ([]byte, error) {

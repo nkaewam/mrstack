@@ -33,6 +33,7 @@ type Globals struct {
 	Yes        bool
 	Remote     string
 	GitLabMode string
+	Debug      bool
 }
 
 type Selector struct {
@@ -88,6 +89,7 @@ Commands:
 Global options:
   --json  --no-input  --yes  --remote <name>
   --gitlab-mode <auto|legacy|native>
+  --debug  print each git/glab subprocess argv and stderr
   -h, --help  --version
 `
 
@@ -161,7 +163,7 @@ func extractGlobals(args []string) ([]string, Globals, error) {
 		arg := args[i]
 		key, value, hasEquals := splitOption(arg)
 		switch key {
-		case "--json", "--no-input", "--yes":
+		case "--json", "--no-input", "--yes", "--debug":
 			if hasEquals {
 				return clean, g, Invalid("invalid_arguments", key+" does not take a value")
 			}
@@ -176,6 +178,8 @@ func extractGlobals(args []string) ([]string, Globals, error) {
 				g.NoInput = true
 			case "--yes":
 				g.Yes = true
+			case "--debug":
+				g.Debug = true
 			}
 		case "--remote", "--gitlab-mode":
 			if seen[key] {

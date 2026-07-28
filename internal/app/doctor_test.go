@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -146,5 +148,75 @@ func TestDoctorWithExplicitModeReportsUnobservableDetectionAsNull(t *testing.T) 
 	if doctor.DetectedMode != nil || doctor.ServerVersion != nil ||
 		doctor.EffectiveMode != "legacy" {
 		t.Fatalf("unobservable explicit mode was represented as detected: %#v", doctor)
+	}
+}
+
+// TestDebugFlagLogsGlabArgvAndStderr verifies --debug installs a runner wrapper
+// that prints each glab argv and any stderr to the handler's stderr sink, so
+// transport failures are diagnosable instead of collapsed to glab_unavailable.
+func TestDebugFlagLogsGlabArgvAndStderr(t *testing.T) {
+	repo, _, _, _, _ := createStackRepository(t)
+	runner := fakeGlabRunner{
+		responses: map[string]json.RawMessage{
+			"/projects/group%2Fproject": json.RawMessage(`{
+				"id":42,"path_with_namespace":"group/project",
+				"web_url":"https://gitlab.example/group/project","default_branch":"main"
+			}`),
+			"/user": json.RawMessage(`{"id":7,"username":"developer"}`),
+		},
+		dynamic: func(endpoint string, args []string) (gitexec.Result, error) {
+			if endpoint == "" && reflect.DeepEqual(args, []string{"--version"}) {
+				return gitexec.Result{Stdout: []byte("glab 1.70.0\n")}, nil
+			}
+			if endpoint == "/version" {
+				return gitexec.Result{Stderr: []byte("version unavailable")},
+					&gitexec.CommandError{Name: "glab", Args: args, ExitCode: 1, Stderr: "version unavailable"}
+			}
+			return gitexec.Result{}, nil
+		},
+	}
+	var stderr bytes.Buffer
+	handler := &Handler{
+		Runner: runner, Dir: repo, Stderr: &stderr,
+		StateDir: filepath.Join(t.TempDir(), "state"),
+	}
+	_, err := handler.Dispatch(context.Background(), cli.Invocation{
+		Name:    cli.CommandDoctor,
+		Globals: cli.Globals{Remote: "origin", GitLabMode: "legacy", Debug: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := stderr.String()
+	if !strings.Contains(log, "glab api") {
+		t.Fatalf("debug log must record glab argv, got: %s", log)
+	}
+	if !strings.Contains(log, "version unavailable") {
+		t.Fatalf("debug log must record glab stderr, got: %s", log)
+	}
+}
+
+// TestClassifyGlabSurfacesUnderlyingError verifies the unavailable mapping
+// no longer swallows the real glab stderr / decode error.
+func TestClassifyGlabSurfacesUnderlyingError(t *testing.T) {
+	t.Parallel()
+	err := classifyGlab("list merge requests", &gitexec.CommandError{
+		Name: "glab", ExitCode: 2, Stderr: "boom from glab",
+	})
+	exitErr, ok := err.(*cli.ExitError)
+	if !ok {
+		t.Fatalf("expected *cli.ExitError, got %T", err)
+	}
+	if !strings.Contains(exitErr.Message, "boom from glab") || !strings.Contains(exitErr.Message, "exited 2") {
+		t.Fatalf("underlying stderr/exit code not surfaced: %q", exitErr.Message)
+	}
+
+	decodeErr := classifyGlab("list merge requests", fmt.Errorf("decode GitLab response for /x: invalid character"))
+	exitErr2, ok := decodeErr.(*cli.ExitError)
+	if !ok {
+		t.Fatalf("expected *cli.ExitError, got %T", decodeErr)
+	}
+	if !strings.Contains(exitErr2.Message, "invalid character") {
+		t.Fatalf("underlying decode error not surfaced: %q", exitErr2.Message)
 	}
 }

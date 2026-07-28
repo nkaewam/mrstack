@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -29,6 +30,7 @@ type Handler struct {
 	Runner   gitexec.CommandRunner
 	Dir      string
 	StateDir string
+	Stderr   io.Writer
 	Now      func() time.Time
 	// Failpoint is an optional deterministic crash-boundary hook used by
 	// mechanical recovery tests. Production handlers leave it nil.
@@ -39,10 +41,15 @@ type Handler struct {
 // New returns a production handler. The repository root is resolved lazily so
 // help and parse failures never touch Git, glab, or the filesystem.
 func New() *Handler {
-	return &Handler{Runner: gitexec.ExecRunner{}, Dir: ".", Now: time.Now}
+	return &Handler{Runner: gitexec.ExecRunner{}, Dir: ".", Stderr: os.Stderr, Now: time.Now}
 }
 
 func (h *Handler) Dispatch(ctx context.Context, inv cli.Invocation) (cli.Result, error) {
+	if inv.Globals.Debug && h.Stderr != nil {
+		original := h.Runner
+		h.Runner = debugRunner{inner: original, log: h.Stderr}
+		defer func() { h.Runner = original }()
+	}
 	switch inv.Name {
 	case cli.CommandDoctor:
 		return h.doctor(ctx, inv)
@@ -182,12 +189,15 @@ func classifyGlab(operation string, err error) error {
 		switch {
 		case strings.Contains(message, "401"), strings.Contains(message, "unauthorized"),
 			strings.Contains(message, "authentication"):
-			return cli.Unavailable("authentication_failed", operation+" failed: GitLab authentication failed", false)
+			return cli.Unavailable("authentication_failed",
+				operation+" failed: GitLab authentication failed", false)
 		default:
-			return cli.Unavailable("gitlab_transport_failed", operation+" failed", true)
+			return cli.Unavailable("gitlab_transport_failed",
+				fmt.Sprintf("%s failed: glab exited %d: %s", operation, commandErr.ExitCode, commandErr.Stderr), true)
 		}
 	}
-	return cli.Unavailable("glab_unavailable", operation+" failed because glab is unavailable", false)
+	return cli.Unavailable("glab_unavailable",
+		operation+" failed because glab is unavailable: "+err.Error(), false)
 }
 
 func stableID(prefix string, value any) string {
@@ -252,4 +262,24 @@ func decimalIID(value string) (int, bool) {
 	value = strings.TrimPrefix(value, "!")
 	n, err := strconv.Atoi(value)
 	return n, err == nil && n > 0
+}
+
+// debugRunner is a CommandRunner wrapper that logs each subprocess argv and
+// any captured stderr to the configured sink. It is installed by Dispatch
+// only when --debug is set, and is removed before Dispatch returns.
+type debugRunner struct {
+	inner gitexec.CommandRunner
+	log   io.Writer
+}
+
+func (r debugRunner) Run(ctx context.Context, dir, name string, args ...string) (gitexec.Result, error) {
+	result, err := r.inner.Run(ctx, dir, name, args...)
+	fmt.Fprintf(r.log, "mrstack: %s %s\n", name, strings.Join(args, " "))
+	if len(result.Stderr) > 0 {
+		fmt.Fprintf(r.log, "mrstack: %s stderr: %s\n", name, strings.TrimSpace(string(result.Stderr)))
+	}
+	if err != nil {
+		fmt.Fprintf(r.log, "mrstack: %s error: %v\n", name, err)
+	}
+	return result, err
 }

@@ -107,6 +107,30 @@ func TestGlobalsAreAcceptedAnywhereAndRemovedBeforeCommandParsing(t *testing.T) 
 	}
 }
 
+func TestDebugGlobalIsAccepted(t *testing.T) {
+	t.Parallel()
+	got, err := Parse([]string{"--debug", "doctor"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Globals.Debug {
+		t.Fatalf("--debug not preserved: %#v", got.Globals)
+	}
+	if got.Name != CommandDoctor {
+		t.Fatalf("command lost: %v", got.Name)
+	}
+}
+
+func TestDebugGlobalRejectsValue(t *testing.T) {
+	t.Parallel()
+	if _, err := Parse([]string{"--debug=yes", "doctor"}); err == nil {
+		t.Fatal("--debug must not accept a value")
+	}
+	if _, err := Parse([]string{"--debug", "--debug", "doctor"}); err == nil {
+		t.Fatal("duplicate --debug must be rejected")
+	}
+}
+
 func TestDefaults(t *testing.T) {
 	t.Parallel()
 	got, err := Parse([]string{"ci", "logs", "--pipeline", "1", "--job", "2"})

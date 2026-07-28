@@ -212,3 +212,105 @@ func FuzzBoundLogsNeverExceedsBudget(f *testing.F) {
 		}
 	})
 }
+
+// mrJSON builds a minimal MR JSON object with the given iid.
+func mrJSON(iid int) string {
+	return `{"iid":` + itoa(iid) + `,"state":"opened","source_branch":"f` + itoa(iid) +
+		`","target_branch":"main","sha":"` + strings.Repeat("a", 40) + `"}`
+}
+
+func itoa(n int) string {
+	// avoid pulling strconv into a tiny helper used only by test fixtures
+	if n == 0 {
+		return "0"
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	return string(b)
+}
+
+// TestMergeRequestsDecodesSingleJSONArray covers the common single-page case
+// (and the shape the existing fake fixtures return).
+func TestMergeRequestsDecodesSingleJSONArray(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{stdout: []byte("[" + mrJSON(1) + "," + mrJSON(2) + "]")}
+	client := Client{Runner: runner}
+	mrs, err := client.MergeRequests(context.Background(), "42", "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mrs) != 2 || mrs[0].IID != 1 || mrs[1].IID != 2 {
+		t.Fatalf("decoded %#v", mrs)
+	}
+}
+
+// TestMergeRequestsDecodesConcatenatedArrays reproduces the reported bug:
+// glab api --paginate in default JSON mode concatenates raw response bodies
+// back-to-back with no separator, producing "[{...p1}][{...p2}]" which is not a
+// valid single JSON document. The streaming decoder must flatten it.
+func TestMergeRequestsDecodesConcatenatedArrays(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{stdout: []byte(
+		"[" + mrJSON(1) + "," + mrJSON(2) + "][" + mrJSON(3) + "," + mrJSON(4) + "]",
+	)}
+	client := Client{Runner: runner}
+	mrs, err := client.MergeRequests(context.Background(), "42", "all")
+	if err != nil {
+		t.Fatalf("multi-page concatenated arrays must decode, got: %v", err)
+	}
+	if len(mrs) != 4 {
+		t.Fatalf("expected 4 MRs across concatenated pages, got %d", len(mrs))
+	}
+	for i, want := range []int{1, 2, 3, 4} {
+		if mrs[i].IID != want {
+			t.Fatalf("mrs[%d].IID=%d want %d", i, mrs[i].IID, want)
+		}
+	}
+}
+
+// TestMergeRequestsDecodesNDJSON covers glab's --output ndjson stream, where
+// each array element is emitted as one JSON object per line.
+func TestMergeRequestsDecodesNDJSON(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{stdout: []byte(
+		mrJSON(1) + "\n" + mrJSON(2) + "\n" + mrJSON(3) + "\n",
+	)}
+	client := Client{Runner: runner}
+	mrs, err := client.MergeRequests(context.Background(), "42", "all")
+	if err != nil {
+		t.Fatalf("ndjson stream must decode, got: %v", err)
+	}
+	if len(mrs) != 3 {
+		t.Fatalf("expected 3 MRs from ndjson, got %d", len(mrs))
+	}
+	for i, want := range []int{1, 2, 3} {
+		if mrs[i].IID != want {
+			t.Fatalf("mrs[%d].IID=%d want %d", i, mrs[i].IID, want)
+		}
+	}
+}
+
+func TestMergeRequestsEmptyArrayDecodes(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{stdout: []byte("[]")}
+	client := Client{Runner: runner}
+	mrs, err := client.MergeRequests(context.Background(), "42", "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mrs != nil && len(mrs) != 0 {
+		t.Fatalf("expected empty result, got %#v", mrs)
+	}
+}
+
+func TestMergeRequestsRejectsMalformedBody(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{stdout: []byte("not-json-at-all")}
+	client := Client{Runner: runner}
+	if _, err := client.MergeRequests(context.Background(), "42", "all"); err == nil {
+		t.Fatal("malformed body must produce a decode error, not a silent success")
+	}
+}
