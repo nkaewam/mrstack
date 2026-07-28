@@ -366,6 +366,10 @@ func (h *Handler) refreshSnapshot(ctx context.Context, captured api.Stack, origi
 		inv.Globals.Remote = captured.Remote.Name
 	}
 	switch captured.Selector.Kind {
+	case "named_stack":
+		inv.Selector.Value = captured.Selector.Value
+	case "tracked_stack":
+		inv.Selector.StackID = captured.Selector.Value
 	case "mr":
 		inv.Selector.Value = "!" + captured.Selector.Value
 	case "branch":
@@ -558,7 +562,7 @@ func (h *Handler) operationInProgress(ctx context.Context, command cli.CommandNa
 		FindingID: finding.FindingID, Kind: "wait_and_recheck",
 		SessionID: &durable.API.SessionID, RequiredWork: &work,
 		EvidenceRefs: append([]string(nil), finding.EvidenceRefs...),
-		Actions:      []api.Action{recheckAction(stack.Remote.Name, cwd)},
+		Actions:      []api.Action{recheckAction(stack.Remote.Name, cwd, namedStackName(&stack))},
 	})
 	if remediationErr != nil {
 		return cli.Result{}, cli.Internal("cannot create active-session remediation", remediationErr)
@@ -1094,10 +1098,16 @@ func (h *Handler) restartReplay(ctx context.Context, inv cli.Invocation, rc repo
 	return h.prepareAndPublish(ctx, inv, rc, j, stored, durable, newHeads)
 }
 
-func (h *Handler) replayRecoveryResult(command cli.CommandName,
+func (h *Handler) replayRecoveryResult(ctx context.Context, command cli.CommandName,
 	session api.Session) (cli.Result, error) {
 	if session.Worktree == nil {
 		return cli.Result{}, cli.Internal("replay recovery lacks managed worktree", nil)
+	}
+	stackName := ""
+	if session.SnapshotID != "" {
+		if _, captured, err := h.loadSnapshot(ctx, session.Remote.Name, session.SnapshotID); err == nil {
+			stackName = namedStackName(&captured.Stack)
+		}
 	}
 	env, factory, err := h.envelope(command)
 	if err != nil {
@@ -1117,7 +1127,7 @@ func (h *Handler) replayRecoveryResult(command cli.CommandName,
 			Kind: "wait_for_external_state", ReasonCode: "operation_in_progress",
 		},
 		EvidenceRefs: []string{},
-		Actions:      []api.Action{recheckAction(session.Remote.Name, session.Worktree.Path)},
+		Actions:      []api.Action{recheckAction(session.Remote.Name, session.Worktree.Path, stackName)},
 	})
 	if err != nil {
 		return cli.Result{}, cli.Internal("cannot create replay recovery remediation", err)
@@ -1262,7 +1272,7 @@ func (h *Handler) recoverSession(ctx context.Context, command cli.CommandName, r
 		}
 		// Recovery is deliberately read-only. Continue performs the idempotent
 		// managed-worktree reset and exact-plan replay.
-		return h.replayRecoveryResult(command, durable.API)
+		return h.replayRecoveryResult(ctx, command, durable.API)
 	case "publication_pending_reconcile", "indeterminate_publication", "publication_ready":
 	default:
 		return cli.Result{}, cli.Invalid("invalid_selector",

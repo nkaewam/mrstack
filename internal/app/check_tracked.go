@@ -11,66 +11,49 @@ import (
 	"github.com/nkaewam/mrstack/internal/cli"
 	"github.com/nkaewam/mrstack/internal/gitlab"
 	"github.com/nkaewam/mrstack/internal/journal"
+	"github.com/nkaewam/mrstack/internal/stack"
 )
 
+// checkTrackedStack reconciles a journal-tracked stack that has fully merged.
+func (h *Handler) checkTrackedStack(ctx context.Context, inv cli.Invocation,
+	rc repositoryContext, _ stack.Mode, persist bool) (cli.Result, error) {
+	return h.reconcileTrackedCompletion(ctx, inv, rc, persist)
+}
+
 func (h *Handler) reconcileTrackedCompletion(ctx context.Context, inv cli.Invocation,
-	rc repositoryContext, mrs []gitlab.MergeRequest, baseSHA string, persist bool) (cli.Result, bool, error) {
+	rc repositoryContext, persist bool) (cli.Result, error) {
 	requestedStack := inv.Selector.StackID
-	requestedIID, iidSelector := decimalIID(inv.Selector.Value)
-	if requestedStack == "" && !iidSelector {
-		return cli.Result{}, false, nil
-	}
 	j, err := h.openJournal(rc.repo.Dir)
 	if err != nil {
-		return cli.Result{}, true, cli.Unavailable("journal_unavailable",
+		return cli.Result{}, cli.Unavailable("journal_unavailable",
 			"cannot inspect tracked stack completion", false)
 	}
 	defer j.Close()
-	if requestedStack == "" {
-		tracked, trackedErr := j.TrackedStacks(ctx, rc.fetch.Host+"/"+rc.fetch.Project)
-		if trackedErr != nil {
-			return cli.Result{}, true, cli.Unavailable("journal_unavailable",
-				"cannot enumerate tracked stack completion", false)
-		}
-		for _, candidate := range tracked {
-			page, pageErr := j.History(ctx, candidate.StackID, 1, "")
-			if pageErr != nil || len(page.Records) == 0 {
-				continue
-			}
-			var historical api.Envelope
-			if json.Unmarshal(page.Records[0].Payload, &historical) != nil || historical.Stack == nil {
-				continue
-			}
-			for _, member := range historical.Stack.Members {
-				if member.IID == requestedIID {
-					if requestedStack != "" && requestedStack != candidate.StackID {
-						return cli.Result{}, true, cli.Invalid("invalid_selector",
-							"merge request belongs to multiple tracked stacks; use --stack")
-					}
-					requestedStack = candidate.StackID
-				}
-			}
-		}
-		if requestedStack == "" {
-			return cli.Result{}, false, nil
-		}
-	}
+
 	page, err := j.History(ctx, requestedStack, 1, "")
 	if errors.Is(err, journal.ErrNotFound) || len(page.Records) == 0 {
-		return cli.Result{}, true, cli.Invalid("invalid_selector", "tracked stack history was not found")
+		return cli.Result{}, cli.Invalid("invalid_selector", "tracked stack history was not found")
 	}
 	if err != nil {
-		return cli.Result{}, true, cli.Unavailable("journal_unavailable",
+		return cli.Result{}, cli.Unavailable("journal_unavailable",
 			"cannot read tracked stack completion history", false)
 	}
 	if err := historyPageBelongsToProject(page, rc.fetch.Host, rc.fetch.Project); err != nil {
-		return cli.Result{}, true, err
+		return cli.Result{}, err
 	}
 	var historical api.Envelope
 	if err := json.Unmarshal(page.Records[0].Payload, &historical); err != nil || historical.Stack == nil {
-		return cli.Result{}, true, cli.Internal("stored stack observation is invalid", err)
+		return cli.Result{}, cli.Internal("stored stack observation is invalid", err)
 	}
 	stackValue := *historical.Stack
+	iids := make([]int, len(stackValue.Members))
+	for i, member := range stackValue.Members {
+		iids[i] = member.IID
+	}
+	mrs, _, _, baseSHA, err := h.fetchMemberMRs(ctx, rc, iids)
+	if err != nil {
+		return cli.Result{}, err
+	}
 	byIID := make(map[int]gitlab.MergeRequest, len(mrs))
 	for _, mr := range mrs {
 		byIID[mr.IID] = mr
@@ -83,11 +66,8 @@ func (h *Handler) reconcileTrackedCompletion(ctx context.Context, inv cli.Invoca
 		}
 	}
 	if !allMerged {
-		if inv.Selector.StackID != "" {
-			return cli.Result{}, true, cli.Invalid("invalid_selector",
-				"tracked stack still has active or non-merged members; select an active member")
-		}
-		return cli.Result{}, false, nil
+		return cli.Result{}, cli.Invalid("invalid_selector",
+			"tracked stack still has active or non-merged members; check the named stack instead")
 	}
 
 	var previous time.Time
@@ -130,25 +110,23 @@ func (h *Handler) reconcileTrackedCompletion(ctx context.Context, inv cli.Invoca
 	}
 	stackValue.SnapshotID = snapshotID(stackValue)
 	if !proven {
-		resultValue, resultErr := h.humanHandoffResult(inv.Name, stackValue,
+		return h.humanHandoffResult(inv.Name, stackValue,
 			"ambiguous_completion", api.FindingScope{Kind: "stack"},
 			"all tracked members are merged, but integration revision or merge order cannot be proven",
 			completionEvidence...)
-		return resultValue, true, resultErr
 	}
 	env, _, err := h.envelope(inv.Name)
 	if err != nil {
-		return cli.Result{}, true, cli.Internal("cannot create completion envelope", err)
+		return cli.Result{}, cli.Internal("cannot create completion envelope", err)
 	}
 	env.Stack = &stackValue
 	disposition := api.DispositionComplete
 	env.Disposition = &disposition
 	if persist {
 		if err := h.persistCheck(ctx, rc, env); err != nil {
-			return cli.Result{}, true, cli.Unavailable("journal_unavailable",
+			return cli.Result{}, cli.Unavailable("journal_unavailable",
 				"cannot persist completed stack observation", false)
 		}
 	}
-	out, err := result(env, fmt.Sprintf("Stack %s: complete", requestedStack))
-	return out, true, err
+	return result(env, fmt.Sprintf("Stack %s: complete", requestedStack))
 }

@@ -43,75 +43,14 @@ func (h *Handler) check(ctx context.Context, inv cli.Invocation, persist bool) (
 	if err != nil {
 		return cli.Result{}, cli.Invalid("invalid_arguments", err.Error())
 	}
-	// A positional selector that matches a named stack bound to this repository
-	// runs the explicit named-stack check path instead of autodiscovery. This
-	// avoids fetching every project MR and validates the user-curated chain.
-	if inv.Selector.Value != "" && inv.Selector.StackID == "" {
-		if handled, res, herr := h.checkNamedStack(ctx, inv, rc, mode); handled {
-			return res, herr
-		}
+	if inv.Selector.StackID != "" {
+		return h.checkTrackedStack(ctx, inv, rc, mode, persist)
 	}
-	mrs, err := rc.client.MergeRequests(ctx, rc.project.ID.String(), "all")
-	if err != nil {
-		return cli.Result{}, classifyGlab("list merge requests", err)
+	if inv.Selector.Value != "" {
+		return h.checkNamedStack(ctx, inv, rc, mode)
 	}
-
-	branches := map[string]string{rc.project.DefaultBranch: ""}
-	for _, mr := range mrs {
-		branches[mr.SourceBranch] = ""
-		branches[mr.TargetBranch] = ""
-	}
-	if err := fetchBranches(ctx, rc, branches); err != nil {
-		return cli.Result{}, cli.Unavailable("git_transport_failed",
-			"cannot fetch exact stack branch revisions", true)
-	}
-	for branch := range branches {
-		oid, revErr := rc.repo.RevParse(ctx, privateRef(branch))
-		if revErr == nil {
-			branches[branch] = oid
-		}
-	}
-	baseSHA := branches[rc.project.DefaultBranch]
-	if !fullOID(baseSHA) {
-		return cli.Result{}, cli.Unavailable("git_transport_failed",
-			"the default branch revision could not be resolved", true)
-	}
-	if completion, handled, completionErr := h.reconcileTrackedCompletion(
-		ctx, inv, rc, mrs, baseSHA, persist); handled {
-		return completion, completionErr
-	}
-
-	var selector stack.Selector
-	var selectorAPI api.Selector
-	switch {
-	case inv.Selector.Value == "":
-		branch, branchErr := rc.repo.CurrentBranch(ctx)
-		if branchErr != nil {
-			return cli.Result{}, cli.Invalid("invalid_selector",
-				"detached HEAD requires an explicit merge request or branch selector")
-		}
-		selector = stack.Selector{Kind: stack.SelectCurrentBranch, Branch: branch}
-		selectorAPI = api.Selector{Kind: "current_branch", Value: branch}
-	case func() bool { _, ok := decimalIID(inv.Selector.Value); return ok }():
-		iid, _ := decimalIID(inv.Selector.Value)
-		selector = stack.Selector{Kind: stack.SelectMergeRequest, IID: iid}
-		selectorAPI = api.Selector{Kind: "mr", Value: strconv.Itoa(iid)}
-	default:
-		selector = stack.Selector{Kind: stack.SelectBranch, Branch: inv.Selector.Value}
-		selectorAPI = api.Selector{Kind: "branch", Value: inv.Selector.Value}
-	}
-
-	domainMRs := make([]stack.MergeRequest, 0, len(mrs))
-	byIID := make(map[int]int, len(mrs))
-	for i, mr := range mrs {
-		domainMRs = append(domainMRs, toDomainMR(ctx, mr, rc, branches, baseSHA))
-		byIID[mr.IID] = i
-	}
-	discovered := stack.Discover(stack.DiscoveryInput{
-		ProjectID: rc.project.ID.String(), DefaultBranch: rc.project.DefaultBranch,
-		BaseSHA: baseSHA, Mode: mode, Selector: selector, MergeRequests: domainMRs,
-	})
-	return h.assessCheck(ctx, inv, rc, mode, mrs, byIID, selectorAPI, discovered, persist)
+	return cli.Result{}, cli.Invalid("invalid_selector",
+		"check requires a named stack or --stack <id>")
 }
 
 // toDomainMR normalizes a gitlab.MergeRequest into the I/O-free stack domain

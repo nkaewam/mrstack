@@ -166,7 +166,7 @@ func (h *Handler) remoteChangedResult(command cli.CommandName, stack api.Stack, 
 		env.Evidence = append(env.Evidence, evidence)
 		finding.EvidenceRefs = append(finding.EvidenceRefs, evidence.EvidenceID)
 	}
-	action := recheckAction(stack.Remote.Name, cwd)
+	action := recheckAction(stack.Remote.Name, cwd, namedStackName(&stack))
 	work := api.RequiredWork{Kind: "wait_for_external_state", ReasonCode: "remote_changed"}
 	remediation, err := factory.NewRemediation(api.Remediation{
 		FindingID: finding.FindingID, Kind: "wait_and_recheck", RequiredWork: &work,
@@ -194,15 +194,22 @@ func stackRefMap(stack api.Stack) map[string]string {
 	return refs
 }
 
-func recheckAction(remote, cwd string) api.Action {
+func recheckAction(remote, cwd, stackName string) api.Action {
 	return api.Action{
 		Kind: "recheck",
 		Argv: []string{
-			"mrstack", "--json", "--no-input", "--remote", remote, "check",
+			"mrstack", "--json", "--no-input", "--remote", remote, "check", stackName,
 		},
 		CWD: cwd, Preconditions: []string{"repository_context_current"},
 		Requires: api.ActionRequirements{JobIDs: []string{}},
 	}
+}
+
+func namedStackName(stack *api.Stack) string {
+	if stack != nil && stack.Selector.Kind == "named_stack" {
+		return stack.Selector.Value
+	}
+	return ""
 }
 
 func (h *Handler) attachCheckPackets(env *api.Envelope, factory *api.Factory, cwd string) error {
@@ -291,7 +298,7 @@ func (h *Handler) attachCheckPackets(env *api.Envelope, factory *api.Factory, cw
 				Kind: "wait_for_external_state", ReasonCode: finding.Code,
 			}
 			remediation.Actions = []api.Action{
-				recheckAction(env.Stack.Remote.Name, cwd),
+				recheckAction(env.Stack.Remote.Name, cwd, namedStackName(env.Stack)),
 			}
 		case api.DispositionActionRequired:
 			switch finding.Code {
@@ -333,7 +340,7 @@ func (h *Handler) attachCheckPackets(env *api.Envelope, factory *api.Factory, cw
 						Kind: "wait_for_external_state", ReasonCode: finding.Code,
 					}
 					remediation.Actions = []api.Action{
-						recheckAction(env.Stack.Remote.Name, cwd),
+						recheckAction(env.Stack.Remote.Name, cwd, namedStackName(env.Stack)),
 					}
 					break
 				}
@@ -357,7 +364,7 @@ func (h *Handler) attachCheckPackets(env *api.Envelope, factory *api.Factory, cw
 							PipelineID: member.Pipeline.ID, JobIDs: append([]string(nil), jobIDs...),
 						},
 					},
-					recheckAction(env.Stack.Remote.Name, cwd),
+					recheckAction(env.Stack.Remote.Name, cwd, namedStackName(env.Stack)),
 				}
 			case "merge_conflict":
 				remediation.Kind = "human_handoff"

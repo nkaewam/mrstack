@@ -75,14 +75,24 @@ func (h *Handler) viewStacksForRepo(ctx context.Context, inv cli.Invocation,
 	return out, nil
 }
 
-// viewStacksCrossProject renders every stack. When live is false only the
-// stored membership is reported; when true each distinct project is resolved
-// via glab and member status is fetched.
+// viewStacksCrossProject renders every stack. When live is false cached view
+// snapshots from the last check are shown when available.
 func (h *Handler) viewStacksCrossProject(ctx context.Context, stacks []stackstore.Stack, live bool) []api.ViewStack {
 	out := make([]api.ViewStack, 0, len(stacks))
 	if !live {
+		store, err := h.stackStore()
 		for _, s := range stacks {
-			out = append(out, membershipViewStack(s, "status unavailable; use --refresh to live-fetch"))
+			if err != nil {
+				out = append(out, membershipViewStack(s, "status unavailable; use --refresh to live-fetch"))
+				continue
+			}
+			cached, cacheErr := store.GetViewSnapshot(s.Name)
+			if cacheErr != nil {
+				out = append(out, membershipViewStack(s,
+					"no cached status; run `mrstack check "+s.Name+"` or use --refresh"))
+				continue
+			}
+			out = append(out, cachedViewStack(cached))
 		}
 		return out
 	}
@@ -160,6 +170,24 @@ func membershipViewStack(s stackstore.Stack, note string) api.ViewStack {
 	vs.Members = make([]api.ViewMember, 0, len(s.MemberIIDs))
 	for i, iid := range s.MemberIIDs {
 		vs.Members = append(vs.Members, api.ViewMember{Position: i, IID: iid})
+	}
+	return vs
+}
+
+func cachedViewStack(cached stackstore.ViewSnapshot) api.ViewStack {
+	vs := api.ViewStack{
+		Name: cached.Name, Host: cached.Host, Project: cached.Project,
+		DefaultBranch: cached.DefaultBranch,
+		Note:          fmt.Sprintf("cached from %s", cached.CheckedAt),
+	}
+	vs.Members = make([]api.ViewMember, 0, len(cached.Members))
+	for _, m := range cached.Members {
+		vs.Members = append(vs.Members, api.ViewMember{
+			Position: m.Position, IID: m.IID, Title: m.Title,
+			SourceBranch: m.SourceBranch, TargetBranch: m.TargetBranch,
+			State: m.State, WebURL: m.WebURL,
+			MergeStatus: m.MergeStatus, PipelineStatus: m.PipelineStatus,
+		})
 	}
 	return vs
 }

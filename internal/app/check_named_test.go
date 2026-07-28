@@ -113,66 +113,19 @@ func TestCheckNamedStackRunsExplicitPathAndSchemaValidates(t *testing.T) {
 	}
 }
 
-func TestCheckFallsBackToAutodiscoveryForUnknownName(t *testing.T) {
-	repo, _, mainOID, firstOID, secondOID := createStackRepository(t)
-	// Provide the all-MR list endpoint so autodiscovery can proceed when the
-	// selector does not name a registered stack.
-	mrs, _ := json.Marshal([]map[string]any{
-		{
-			"iid": 1, "state": "opened", "source_branch": "feature/one", "target_branch": "main",
-			"sha": firstOID, "web_url": "https://gitlab.example/group/project/-/merge_requests/1",
-			"author":                map[string]any{"id": 7, "username": "developer"},
-			"diff_refs":             map[string]any{"base_sha": mainOID, "head_sha": firstOID, "start_sha": mainOID},
-			"detailed_merge_status": "mergeable",
-		},
-		{
-			"iid": 2, "state": "opened", "source_branch": "feature/two", "target_branch": "feature/one",
-			"sha": secondOID, "web_url": "https://gitlab.example/group/project/-/merge_requests/2",
-			"author":                map[string]any{"id": 7, "username": "developer"},
-			"diff_refs":             map[string]any{"base_sha": firstOID, "head_sha": secondOID, "start_sha": firstOID},
-			"detailed_merge_status": "mergeable",
-		},
-	})
-	runner := fakeGlabRunner{responses: map[string]json.RawMessage{
-		"/version": json.RawMessage(`{"version":"18.11.2"}`),
-		"/projects/group%2Fproject": json.RawMessage(`{
-			"id":42,"path_with_namespace":"group/project",
-			"web_url":"https://gitlab.example/group/project","default_branch":"main",
-			"only_allow_merge_if_pipeline_succeeds":false
-		}`),
-		"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
-	}}
+func TestCheckUnknownNamedStackFails(t *testing.T) {
+	repo, _, _, _, _ := createStackRepository(t)
 	stacksDir := t.TempDir()
 	handler := &Handler{
-		Runner: runner, Dir: repo, StacksDir: stacksDir,
+		Runner: fakeGlabRunner{responses: glabProjectResponses(false)},
+		Dir:    repo, StacksDir: stacksDir,
 		Now: func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
 	}
 	var stdout, stderr bytes.Buffer
-	// "feature/two" is not a registered named stack -> autodiscovery fallback.
 	exit := cli.RunWithHandler([]string{
-		"--json", "--no-input", "--remote", "origin", "check", "feature/two",
+		"--json", "--no-input", "--remote", "origin", "check", "missing",
 	}, &stdout, &stderr, handler)
-	if exit != 0 {
-		t.Fatalf("check feature/two failed: exit=%d stderr=%s", exit, stderr.String())
-	}
-	var env struct {
-		Stack struct {
-			Selector struct {
-				Kind string `json:"kind"`
-			} `json:"selector"`
-			Members []struct {
-				IID int `json:"iid"`
-			} `json:"members"`
-		} `json:"stack"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
-		t.Fatal(err)
-	}
-	// Autodiscovery uses a branch selector, not named_stack.
-	if env.Stack.Selector.Kind != "branch" {
-		t.Fatalf("expected branch selector for fallback, got %q", env.Stack.Selector.Kind)
-	}
-	if len(env.Stack.Members) != 2 {
-		t.Fatalf("autodiscovery should find both members: %+v", env.Stack.Members)
+	if exit != 2 {
+		t.Fatalf("check missing failed: exit=%d stderr=%s", exit, stderr.String())
 	}
 }

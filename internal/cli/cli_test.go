@@ -52,7 +52,7 @@ func TestRunMachineSuccessIsExactlyOneJSONDocumentAndNoPrompt(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	machine := map[string]any{"api_version": APIVersion, "sentinel": "yes"}
 	exit := RunWithHandler(
-		[]string{"--json", "check", "--no-input"},
+		[]string{"--json", "check", "stk", "--no-input"},
 		&stdout, &stderr,
 		HandlerFunc(func(_ context.Context, inv Invocation) (Result, error) {
 			if !inv.Machine() {
@@ -93,26 +93,26 @@ func TestRunMachineFailuresUseFrozenExitClassesAndCompleteEnvelope(t *testing.T)
 			2, "invalid_input", "invalid_arguments", CommandCheck,
 		},
 		{
-			"unavailable", []string{"check", "--json", "--no-input"},
+			"unavailable", []string{"check", "stk", "--json", "--no-input"},
 			HandlerFunc(func(context.Context, Invocation) (Result, error) {
 				return Result{}, Unavailable("gitlab_transport_failed", "transport failed", true)
 			}),
 			3, "unavailable", "gitlab_transport_failed", CommandCheck,
 		},
 		{
-			"internal", []string{"check", "--json", "--no-input"},
+			"internal", []string{"check", "stk", "--json", "--no-input"},
 			HandlerFunc(func(context.Context, Invocation) (Result, error) {
 				return Result{}, errors.New("secret implementation detail")
 			}),
 			4, "internal", "internal_invariant_failed", CommandCheck,
 		},
 		{
-			"nil machine result", []string{"check", "--json", "--no-input"},
+			"nil machine result", []string{"check", "stk", "--json", "--no-input"},
 			HandlerFunc(func(context.Context, Invocation) (Result, error) { return Result{}, nil }),
 			4, "internal", "internal_invariant_failed", CommandCheck,
 		},
 		{
-			"invalid handler classification", []string{"check", "--json", "--no-input"},
+			"invalid handler classification", []string{"check", "stk", "--json", "--no-input"},
 			HandlerFunc(func(context.Context, Invocation) (Result, error) {
 				return Result{}, &ExitError{Class: "authoritative", Code: "ok", Message: "not a failure"}
 			}),

@@ -704,8 +704,9 @@ func actionInvocation(a Action) (cli.Invocation, error) {
 			return zero, errors.New("api: fetch_ci_logs argv disagrees with required pipeline/jobs")
 		}
 	case "recheck":
-		if inv.Name != cli.CommandCheck || inv.Selector.Value != "" || inv.Selector.StackID != "" {
-			return zero, errors.New("api: recheck argv must perform an unselected repository check")
+		if inv.Name != cli.CommandCheck || inv.Selector.StackID != "" ||
+			strings.TrimSpace(inv.Selector.Value) == "" {
+			return zero, errors.New("api: recheck argv must check a named stack")
 		}
 	default:
 		return zero, fmt.Errorf("api: unknown action kind %q", a.Kind)

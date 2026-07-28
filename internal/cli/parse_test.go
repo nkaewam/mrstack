@@ -18,9 +18,8 @@ func TestParseEveryDocumentedCommand(t *testing.T) {
 		check func(*testing.T, Invocation)
 	}{
 		{"doctor", []string{"doctor"}, CommandDoctor, nil},
-		{"check current", []string{"check"}, CommandCheck, nil},
-		{"check selector", []string{"check", "feature/a"}, CommandCheck, func(t *testing.T, i Invocation) {
-			equal(t, i.Selector.Value, "feature/a")
+		{"check named stack", []string{"check", "web-migration"}, CommandCheck, func(t *testing.T, i Invocation) {
+			equal(t, i.Selector.Value, "web-migration")
 		}},
 		{"check stack", []string{"check", "--stack", "stk_1"}, CommandCheck, func(t *testing.T, i Invocation) {
 			equal(t, i.Selector.StackID, "stk_1")
@@ -300,7 +299,7 @@ func TestMachineMutationsAcceptYesAndReadOnlyCommandsDoNotRequireIt(t *testing.T
 		{"restack", "abort", "--session", "s", "--json", "--no-input", "--yes"},
 		{"history", "prune", "--before", "1d", "--json", "--no-input", "--yes"},
 		{"doctor", "--json", "--no-input"},
-		{"check", "--json", "--no-input"},
+		{"check", "web-migration", "--json", "--no-input"},
 		{"restack", "plan", "--snapshot", "s", "--layer-boundary", "1=" + sha, "--json", "--no-input"},
 		{"restack", "recover", "--session", "s", "--json", "--no-input"},
 		{"history", "alias", "--stack", "s", "--clear", "--json", "--no-input"},

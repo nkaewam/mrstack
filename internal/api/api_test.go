@@ -681,7 +681,7 @@ func TestActionArgvMustMatchKindAndRequiredIdentities(t *testing.T) {
 		base("fetch_ci_logs", []string{"ci", "logs", "--pipeline", pipeline, "--job", "7", "--job", "8"}, false,
 			[]string{"pipeline_and_jobs_pinned"},
 			ActionRequirements{PipelineID: &pipeline, JobIDs: []string{"7", "8"}}),
-		base("recheck", []string{"check"}, false, []string{"repository_context_current"},
+		base("recheck", []string{"check", "stk"}, false, []string{"repository_context_current"},
 			ActionRequirements{JobIDs: []string{}}),
 	}
 	for _, action := range valid {
@@ -731,7 +731,7 @@ func TestActionArgvMustMatchKindAndRequiredIdentities(t *testing.T) {
 	modeOverride.Argv = append(modeOverride.Argv, "--gitlab-mode", "legacy")
 	hostile["mode override"] = modeOverride
 	remoteOmission := hostile["remote omission"]
-	remoteOmission.Argv = []string{"mrstack", "--json", "--no-input", "check"}
+	remoteOmission.Argv = []string{"mrstack", "--json", "--no-input", "check", "stk"}
 	hostile["remote omission"] = remoteOmission
 	for name, action := range hostile {
 		action := action

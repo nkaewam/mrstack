@@ -91,7 +91,7 @@ const HelpText = `Usage:
 
 Commands:
   doctor
-  check [<MR-or-branch> | --stack <id>]
+  check <name> | --stack <id>
   restack [<MR-or-branch>] --snapshot <id>
   restack plan [<MR-or-branch>] --snapshot <id> --layer-boundary <mr>=<sha>
   restack --plan <id>
@@ -155,7 +155,7 @@ func Parse(args []string) (Invocation, error) {
 		err = noArgs(clean[1:], "doctor")
 	case "check":
 		inv.Name = CommandCheck
-		err = parseSelected(clean[1:], &inv, nil)
+		err = parseCheck(clean[1:], &inv)
 	case "restack":
 		err = parseRestack(clean[1:], &inv)
 	case "ci":
@@ -590,6 +590,17 @@ func parseSelected(args []string, inv *Invocation, extra map[string]func(string)
 	}
 	if inv.Selector.Value != "" && inv.Selector.StackID != "" {
 		return Invalid("invalid_arguments", "a selector and --stack are mutually exclusive")
+	}
+	return nil
+}
+
+// parseCheck requires a named stack positional or --stack <id> for tracked completion.
+func parseCheck(args []string, inv *Invocation) error {
+	if err := parseSelected(args, inv, nil); err != nil {
+		return err
+	}
+	if inv.Selector.Value == "" && inv.Selector.StackID == "" {
+		return Invalid("invalid_arguments", "check requires a stack name or --stack <id>")
 	}
 	return nil
 }

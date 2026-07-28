@@ -3,7 +3,9 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,13 +36,14 @@ func stackMR(iid int, title, source, target, state, mergeStatus, pipeline string
 // responses, with the named-stack store rooted at a temp directory.
 func viewHandler(t *testing.T, repo string, responses map[string]json.RawMessage) (*Handler, string) {
 	t.Helper()
-	stacksDir := t.TempDir()
+	root := t.TempDir()
 	h := &Handler{
 		Runner: fakeGlabRunner{responses: responses},
-		Dir:    repo, StacksDir: stacksDir,
-		Now: func() time.Time { return time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC) },
+		Dir:    repo, StacksDir: filepath.Join(root, "stacks"),
+		StateDir: filepath.Join(root, "state"),
+		Now:      func() time.Time { return time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC) },
 	}
-	return h, stacksDir
+	return h, filepath.Join(root, "stacks")
 }
 
 func runView(t *testing.T, h *Handler, args ...string) (int, []byte, []byte) {
@@ -48,6 +51,15 @@ func runView(t *testing.T, h *Handler, args ...string) (int, []byte, []byte) {
 	var stdout, stderr bytes.Buffer
 	exit := cli.RunWithHandler(args, &stdout, &stderr, h)
 	return exit, stdout.Bytes(), stderr.Bytes()
+}
+
+func mustMRJSON(t *testing.T, payload map[string]any) json.RawMessage {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
 }
 
 func viewEnvelope(t *testing.T, stdout []byte) api.ViewData {
@@ -160,11 +172,45 @@ func TestViewCurrentRepoLiveFetchesStatus(t *testing.T) {
 	}
 }
 
-func TestViewAllWithoutRefreshIsMembershipOnly(t *testing.T) {
-	repo, _, _, _, _ := createStackRepository(t)
-	h, stacksDir := viewHandler(t, repo, nil)
+func TestViewAllWithoutRefreshUsesCachedSnapshot(t *testing.T) {
+	repo, _, mainOID, firstOID, secondOID := createStackRepository(t)
+	responses := map[string]json.RawMessage{
+		"/version": json.RawMessage(`{"version":"18.11.2"}`),
+		"/projects/group%2Fproject": json.RawMessage(`{
+			"id":42,"path_with_namespace":"group/project",
+			"web_url":"https://gitlab.example/group/project","default_branch":"main",
+			"only_allow_merge_if_pipeline_succeeds":false
+		}`),
+		"/projects/42/merge_requests/1": mustMRJSON(t, map[string]any{
+			"iid": 1, "state": "opened", "title": "feat: one",
+			"source_branch": "feature/one", "target_branch": "main", "sha": firstOID,
+			"web_url": "https://gitlab.example/group/project/-/merge_requests/1",
+			"author":  map[string]any{"id": 7, "username": "dev"},
+			"diff_refs": map[string]any{
+				"base_sha": mainOID, "head_sha": firstOID, "start_sha": mainOID,
+			},
+			"detailed_merge_status": "mergeable", "has_conflicts": false,
+		}),
+		"/projects/42/merge_requests/2": mustMRJSON(t, map[string]any{
+			"iid": 2, "state": "opened", "title": "feat: two",
+			"source_branch": "feature/two", "target_branch": "feature/one", "sha": secondOID,
+			"web_url": "https://gitlab.example/group/project/-/merge_requests/2",
+			"author":  map[string]any{"id": 7, "username": "dev"},
+			"diff_refs": map[string]any{
+				"base_sha": firstOID, "head_sha": secondOID, "start_sha": firstOID,
+			},
+			"detailed_merge_status": "conflict", "has_conflicts": true,
+		}),
+	}
+	h, stacksDir := viewHandler(t, repo, responses)
 	if exit, _, _ := runView(t, h, "--json", "--no-input", "--remote", "origin", "stack", "create", "cur"); exit != 0 {
 		t.Fatalf("create failed: exit=%d", exit)
+	}
+	if exit, _, _ := runView(t, h, "--json", "--no-input", "stack", "add", "cur", "1", "2"); exit != 0 {
+		t.Fatalf("add failed: exit=%d", exit)
+	}
+	if exit, stdout, stderr := runView(t, h, "--json", "--no-input", "--remote", "origin", "check", "cur"); exit != 0 {
+		t.Fatalf("check failed: exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
 	}
 	store, err := stackstore.Open(stacksDir)
 	if err != nil {
@@ -185,12 +231,33 @@ func TestViewAllWithoutRefreshIsMembershipOnly(t *testing.T) {
 	if len(data.Stacks) != 2 {
 		t.Fatalf("expected both stacks: %+v", data.Stacks)
 	}
-	// Membership-only: titles and status are empty.
-	for _, s := range data.Stacks {
-		for _, m := range s.Members {
-			if m.Title != "" || m.MergeStatus != "" || m.PipelineStatus != "" {
-				t.Fatalf("non-live member must have no status: %+v", m)
-			}
+	var cur, foreign *api.ViewStack
+	for i := range data.Stacks {
+		switch data.Stacks[i].Name {
+		case "cur":
+			cur = &data.Stacks[i]
+		case "foreign":
+			foreign = &data.Stacks[i]
 		}
+	}
+	if cur == nil || foreign == nil {
+		t.Fatalf("expected cur and foreign stacks: %+v", data.Stacks)
+	}
+	if len(cur.Members) != 2 || cur.Members[0].Title == "" || cur.Members[1].MergeStatus != "conflict" {
+		t.Fatalf("cached stack must include status: %+v", cur.Members)
+	}
+	if cur.Members[1].PipelineStatus != "" && cur.Members[1].PipelineStatus != "none" {
+		t.Fatalf("cached pipeline status unexpected: %q", cur.Members[1].PipelineStatus)
+	}
+	if cur.Note == "" || !strings.Contains(cur.Note, "cached from") {
+		t.Fatalf("cached stack must note cache time: %q", cur.Note)
+	}
+	for _, m := range foreign.Members {
+		if m.Title != "" || m.MergeStatus != "" || m.PipelineStatus != "" {
+			t.Fatalf("uncached foreign stack must be membership-only: %+v", m)
+		}
+	}
+	if foreign.Note == "" || !strings.Contains(foreign.Note, "no cached status") {
+		t.Fatalf("foreign stack must explain missing cache: %q", foreign.Note)
 	}
 }

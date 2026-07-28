@@ -102,7 +102,7 @@ func (r fakeGlabRunner) Run(ctx context.Context, dir, command string, args ...st
 
 func TestCheckMachineOutputFromFakeGlabValidatesAgainstPublishedSchema(t *testing.T) {
 	repo, remote, mainOID, firstOID, secondOID := createStackRepository(t)
-	mrs, err := json.Marshal([]map[string]any{
+	payload := []map[string]any{
 		{
 			"iid": 1, "state": "opened", "source_branch": "feature/one", "target_branch": "main",
 			"sha": firstOID, "web_url": "https://gitlab.example/group/project/-/merge_requests/1",
@@ -117,26 +117,19 @@ func TestCheckMachineOutputFromFakeGlabValidatesAgainstPublishedSchema(t *testin
 			"diff_refs":             map[string]any{"base_sha": firstOID, "head_sha": secondOID, "start_sha": firstOID},
 			"detailed_merge_status": "mergeable",
 		},
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
-	runner := fakeGlabRunner{responses: map[string]json.RawMessage{
-		"/version": json.RawMessage(`{"version":"18.11.2"}`),
-		"/projects/group%2Fproject": json.RawMessage(`{
-			"id":42,"path_with_namespace":"group/project",
-			"web_url":"https://gitlab.example/group/project","default_branch":"main",
-			"only_allow_merge_if_pipeline_succeeds":false
-		}`),
-		"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
-	}}
+	stateDir, stacksDir := testDirs(t)
+	responses := glabProjectResponses(false)
+	addPerMREndpoints(responses, payload)
+	runner := fakeGlabRunner{responses: responses}
 	handler := &Handler{
-		Runner: runner, Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
+		Runner: runner, Dir: repo, StateDir: stateDir, StacksDir: stacksDir,
 		Now: func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
 	}
+	registerNamedStack(t, handler, testStackName, 1, 2)
 	var stdout, stderr bytes.Buffer
 	exit := cli.RunWithHandler([]string{
-		"--json", "--no-input", "--remote", "origin", "check", "feature/two",
+		"--json", "--no-input", "--remote", "origin", "check", testStackName,
 	}, &stdout, &stderr, handler)
 	if exit != 0 {
 		t.Fatalf("exit=%d\nstdout=%s\nstderr=%s\nremote=%s", exit, stdout.String(), stderr.String(), remote)
@@ -198,43 +191,20 @@ func TestRestackPublishesAffectedSuffixOnceAndEmitsSchemaValidSession(t *testing
 	runGit(t, repo, "push", "origin", "main")
 	runGit(t, repo, "checkout", "feature/two")
 
-	mrs, err := json.Marshal([]map[string]any{
-		{
-			"iid": 1, "state": "opened", "source_branch": "feature/one", "target_branch": "main",
-			"sha": firstOID, "web_url": "https://gitlab.example/group/project/-/merge_requests/1",
-			"author":                map[string]any{"id": 7, "username": "developer"},
-			"diff_refs":             map[string]any{"base_sha": originalMain, "head_sha": firstOID, "start_sha": originalMain},
-			"detailed_merge_status": "mergeable",
-		},
-		{
-			"iid": 2, "state": "opened", "source_branch": "feature/two", "target_branch": "feature/one",
-			"sha": secondOID, "web_url": "https://gitlab.example/group/project/-/merge_requests/2",
-			"author":                map[string]any{"id": 7, "username": "developer"},
-			"diff_refs":             map[string]any{"base_sha": firstOID, "head_sha": secondOID, "start_sha": firstOID},
-			"detailed_merge_status": "mergeable",
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	var calls [][]string
+	stateDir, stacksDir := testDirs(t)
+	responses := glabProjectResponses(false)
+	responses["/user"] = json.RawMessage(`{"id":7,"username":"developer"}`)
+	addPerMREndpoints(responses, stackMRPayload(originalMain, firstOID, secondOID, "opened", "", ""))
 	handler := &Handler{
-		Runner: fakeGlabRunner{responses: map[string]json.RawMessage{
-			"/version": json.RawMessage(`{"version":"18.11.2"}`),
-			"/user":    json.RawMessage(`{"id":7,"username":"developer"}`),
-			"/projects/group%2Fproject": json.RawMessage(`{
-				"id":42,"path_with_namespace":"group/project",
-				"web_url":"https://gitlab.example/group/project","default_branch":"main",
-				"only_allow_merge_if_pipeline_succeeds":false
-			}`),
-			"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
-		}, calls: &calls},
-		Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
+		Runner: fakeGlabRunner{responses: responses, calls: &calls},
+		Dir:    repo, StateDir: stateDir, StacksDir: stacksDir,
 		Now: func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
 	}
+	registerNamedStack(t, handler, testStackName, 1, 2)
 	var checked bytes.Buffer
 	exit := cli.RunWithHandler([]string{
-		"--json", "--no-input", "--remote", "origin", "check", "feature/two",
+		"--json", "--no-input", "--remote", "origin", "check", testStackName,
 	}, &checked, &bytes.Buffer{}, handler)
 	if exit != 0 {
 		t.Fatalf("check exit=%d output=%s", exit, checked.String())
@@ -544,9 +514,9 @@ func TestRestackDefaultBranchMovementIsAuthoritativeBeforeAndAfterReplay(t *test
 				runner := handler.Runner.(fakeGlabRunner)
 				var refreshes int
 				runner.dynamic = func(endpoint string, _ []string) (gitexec.Result, error) {
-					if endpoint == "/projects/42/merge_requests?state=all&scope=all&per_page=100" {
+					if strings.HasPrefix(endpoint, "/projects/42/merge_requests/") {
 						refreshes++
-						if refreshes == 2 {
+						if refreshes == 3 {
 							advance()
 						}
 					}
@@ -777,20 +747,20 @@ func TestHistoryShowAliasAndPruneThroughMachineInterface(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	stateDir, stacksDir := testDirs(t)
+	responses := glabProjectResponses(false)
+	var payload []map[string]any
+	if err := json.Unmarshal(mrs, &payload); err != nil {
+		t.Fatal(err)
+	}
+	addPerMREndpoints(responses, payload)
 	handler := &Handler{
-		Runner: fakeGlabRunner{responses: map[string]json.RawMessage{
-			"/version": json.RawMessage(`{"version":"18.11.2"}`),
-			"/projects/group%2Fproject": json.RawMessage(`{
-				"id":42,"path_with_namespace":"group/project",
-				"web_url":"https://gitlab.example/group/project","default_branch":"main",
-				"only_allow_merge_if_pipeline_succeeds":false
-			}`),
-			"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
-		}},
-		Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
+		Runner: fakeGlabRunner{responses: responses},
+		Dir:    repo, StateDir: stateDir, StacksDir: stacksDir,
 		Now: func() time.Time { return now },
 	}
-	first := runMachine(t, handler, "check", "feature/two")
+	registerNamedStack(t, handler, testStackName, 1, 2)
+	first := runMachine(t, handler, "check", testStackName)
 	if first.exit != 0 {
 		t.Fatalf("first check failed: %s", first.stdout)
 	}
@@ -803,7 +773,7 @@ func TestHistoryShowAliasAndPruneThroughMachineInterface(t *testing.T) {
 	runGit(t, repo, "push", "origin", "main")
 	runGit(t, repo, "checkout", "feature/two")
 	now = now.Add(time.Hour)
-	second := runMachine(t, handler, "check", "feature/two")
+	second := runMachine(t, handler, "check", testStackName)
 	if second.exit != 0 {
 		t.Fatalf("second check failed: %s", second.stdout)
 	}
@@ -918,22 +888,16 @@ func TestCheckReconcilesTrackedFullyMergedStackOrFailsClosed(t *testing.T) {
 	for _, ambiguous := range []bool{false, true} {
 		t.Run(map[bool]string{false: "complete", true: "ambiguous"}[ambiguous], func(t *testing.T) {
 			repo, _, mainOID, firstOID, secondOID := createStackRepository(t)
-			responses := map[string]json.RawMessage{
-				"/version": json.RawMessage(`{"version":"18.11.2"}`),
-				"/projects/group%2Fproject": json.RawMessage(`{
-					"id":42,"path_with_namespace":"group/project",
-					"web_url":"https://gitlab.example/group/project","default_branch":"main",
-					"only_allow_merge_if_pipeline_succeeds":false
-				}`),
-			}
-			openMRs, _ := json.Marshal(stackMRPayload(mainOID, firstOID, secondOID, "opened", "", ""))
-			responses["/projects/42/merge_requests?state=all&scope=all&per_page=100"] = openMRs
+			responses := glabProjectResponses(false)
+			addPerMREndpoints(responses, stackMRPayload(mainOID, firstOID, secondOID, "opened", "", ""))
+			stateDir, stacksDir := testDirs(t)
 			handler := &Handler{
 				Runner: fakeGlabRunner{responses: responses}, Dir: repo,
-				StateDir: filepath.Join(t.TempDir(), "state"),
-				Now:      func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
+				StateDir: stateDir, StacksDir: stacksDir,
+				Now: func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
 			}
-			observed := runMachine(t, handler, "check", "feature/two")
+			registerNamedStack(t, handler, testStackName, 1, 2)
+			observed := runMachine(t, handler, "check", testStackName)
 			var captured api.Envelope
 			if observed.exit != 0 || json.Unmarshal([]byte(observed.stdout), &captured) != nil ||
 				captured.Stack == nil {
@@ -948,9 +912,8 @@ func TestCheckReconcilesTrackedFullyMergedStackOrFailsClosed(t *testing.T) {
 			if ambiguous {
 				secondIntegration = ""
 			}
-			mergedMRs, _ := json.Marshal(stackMRPayload(
+			addPerMREndpoints(responses, stackMRPayload(
 				mainOID, firstOID, secondOID, "merged", firstIntegration, secondIntegration))
-			responses["/projects/42/merge_requests?state=all&scope=all&per_page=100"] = mergedMRs
 
 			reconciled := runMachine(t, handler, "check", "--stack", captured.Stack.StackID)
 			if reconciled.exit != 0 {
@@ -976,24 +939,19 @@ func TestCheckReconcilesTrackedFullyMergedStackOrFailsClosed(t *testing.T) {
 
 func TestTrackedCompletionRejectsSameIIDsFromDifferentCanonicalProject(t *testing.T) {
 	repo, _, mainOID, firstOID, secondOID := createStackRepository(t)
-	mrs, _ := json.Marshal(stackMRPayload(mainOID, firstOID, secondOID, "opened", "", ""))
 	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	stateDir, stacksDir := testDirs(t)
+	responses := glabProjectResponses(false)
+	addPerMREndpoints(responses, stackMRPayload(mainOID, firstOID, secondOID, "opened", "", ""))
 	handler := &Handler{
-		Runner: fakeGlabRunner{responses: map[string]json.RawMessage{
-			"/version": json.RawMessage(`{"version":"18.11.2"}`),
-			"/projects/group%2Fproject": json.RawMessage(`{
-				"id":42,"path_with_namespace":"group/project",
-				"web_url":"https://gitlab.example/group/project","default_branch":"main",
-				"only_allow_merge_if_pipeline_succeeds":false
-			}`),
-			"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
-		}},
-		Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
+		Runner: fakeGlabRunner{responses: responses},
+		Dir:    repo, StateDir: stateDir, StacksDir: stacksDir,
 		Now: func() time.Time {
 			return now
 		},
 	}
-	observed := runMachine(t, handler, "check", "feature/two")
+	registerNamedStack(t, handler, testStackName, 1, 2)
+	observed := runMachine(t, handler, "check", testStackName)
 	var historical api.Envelope
 	if observed.exit != 0 || json.Unmarshal([]byte(observed.stdout), &historical) != nil ||
 		historical.Stack == nil {
@@ -1133,32 +1091,37 @@ func TestLegacySquashAdvancementRetargetFailureIsDurableAndRetryOnly(t *testing.
 		}
 		current := strings.Fields(runGit(t, repo, "ls-remote", "--heads", "origin",
 			"refs/heads/feature/successor"))[0]
+		target := "feature/merged"
+		if targetApplied {
+			target = "main"
+		}
 		body, marshalErr := json.Marshal(map[string]any{
 			"iid": 2, "state": "opened", "source_branch": "feature/successor",
-			"target_branch": func() string {
-				if targetApplied {
-					return "main"
-				}
-				return "feature/merged"
-			}(), "sha": current,
+			"target_branch": target, "sha": current,
+			"web_url": "https://gitlab.example/group/project/-/merge_requests/2",
+			"author":  map[string]any{"id": 7, "username": "developer"},
+			"diff_refs": map[string]any{
+				"base_sha": mergedOID, "head_sha": current, "start_sha": mergedOID,
+			},
+			"detailed_merge_status": "mergeable",
 		})
 		return gitexec.Result{Stdout: body}, marshalErr
 	}
+	stateDir, stacksDir := testDirs(t)
+	responses := glabProjectResponses(false)
+	responses["/user"] = json.RawMessage(`{"id":7,"username":"developer"}`)
+	var payload []map[string]any
+	if err := json.Unmarshal(mrs, &payload); err != nil {
+		t.Fatal(err)
+	}
+	addPerMREndpoints(responses, payload)
 	handler := &Handler{
-		Runner: fakeGlabRunner{responses: map[string]json.RawMessage{
-			"/version": json.RawMessage(`{"version":"18.11.2"}`),
-			"/user":    json.RawMessage(`{"id":7,"username":"developer"}`),
-			"/projects/group%2Fproject": json.RawMessage(`{
-				"id":42,"path_with_namespace":"group/project",
-				"web_url":"https://gitlab.example/group/project","default_branch":"main",
-				"only_allow_merge_if_pipeline_succeeds":false
-			}`),
-			"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
-		}, calls: &calls, dynamic: dynamic},
-		Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
+		Runner: fakeGlabRunner{responses: responses, calls: &calls, dynamic: dynamic},
+		Dir:    repo, StateDir: stateDir, StacksDir: stacksDir,
 		Now: func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
 	}
-	check := runMachine(t, handler, "check", "feature/successor")
+	registerNamedStack(t, handler, testStackName, 1, 2)
+	check := runMachine(t, handler, "check", testStackName)
 	if check.exit != 0 {
 		t.Fatalf("legacy check failed: %s", check.stdout)
 	}
@@ -1479,21 +1442,21 @@ func pausedSessionFixture(t *testing.T, kind string) (*Handler, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	stateDir, stacksDir := testDirs(t)
+	responses := glabProjectResponses(false)
+	responses["/user"] = json.RawMessage(`{"id":7,"username":"developer"}`)
+	var payload []map[string]any
+	if err := json.Unmarshal(mrs, &payload); err != nil {
+		t.Fatal(err)
+	}
+	addPerMREndpoints(responses, payload)
 	handler := &Handler{
-		Runner: fakeGlabRunner{responses: map[string]json.RawMessage{
-			"/version": json.RawMessage(`{"version":"18.11.2"}`),
-			"/user":    json.RawMessage(`{"id":7,"username":"developer"}`),
-			"/projects/group%2Fproject": json.RawMessage(`{
-				"id":42,"path_with_namespace":"group/project",
-				"web_url":"https://gitlab.example/group/project","default_branch":"main",
-				"only_allow_merge_if_pipeline_succeeds":false
-			}`),
-			"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
-		}},
-		Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
+		Runner: fakeGlabRunner{responses: responses},
+		Dir:    repo, StateDir: stateDir, StacksDir: stacksDir,
 		Now: func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
 	}
-	check := runMachine(t, handler, "check", "feature")
+	registerNamedStack(t, handler, testStackName, 1)
+	check := runMachine(t, handler, "check", testStackName)
 	if check.exit != 0 {
 		t.Fatalf("fixture check failed: %s", check.stdout)
 	}
@@ -1519,23 +1482,20 @@ func movingBaseRestackFixture(t *testing.T) (*Handler, string, string, string, *
 	runGit(t, repo, "commit", "-m", "advance base")
 	runGit(t, repo, "push", "origin", "main")
 	runGit(t, repo, "checkout", "feature/two")
-	mrs, _ := json.Marshal(stackMRPayload(originalMain, firstOID, secondOID, "opened", "", ""))
 	var calls [][]string
+	stateDir, stacksDir := testDirs(t)
+	responses := glabProjectResponses(false)
+	responses["/user"] = json.RawMessage(`{"id":7,"username":"developer"}`)
+	addPerMREndpoints(responses, stackMRPayload(originalMain, firstOID, secondOID, "opened", "", ""))
 	handler := &Handler{
-		Runner: fakeGlabRunner{responses: map[string]json.RawMessage{
-			"/version": json.RawMessage(`{"version":"18.11.2"}`),
-			"/user":    json.RawMessage(`{"id":7,"username":"developer"}`),
-			"/projects/group%2Fproject": json.RawMessage(`{
-				"id":42,"path_with_namespace":"group/project",
-				"web_url":"https://gitlab.example/group/project","default_branch":"main",
-				"only_allow_merge_if_pipeline_succeeds":false
-			}`),
-			"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
-		}, calls: &calls},
-		Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
-		Now: func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
+		Runner:    fakeGlabRunner{responses: responses, calls: &calls},
+		Dir:       repo,
+		StateDir:  stateDir,
+		StacksDir: stacksDir,
+		Now:       func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
 	}
-	check := runMachine(t, handler, "check", "feature/two")
+	registerNamedStack(t, handler, testStackName, 1, 2)
+	check := runMachine(t, handler, "check", testStackName)
 	var envelope api.Envelope
 	if check.exit != 0 || json.Unmarshal([]byte(check.stdout), &envelope) != nil || envelope.Stack == nil {
 		t.Fatalf("moving-base fixture check failed: %s", check.stdout)

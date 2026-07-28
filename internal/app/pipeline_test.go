@@ -3,7 +3,6 @@ package app
 import (
 	"bytes"
 	"encoding/json"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -32,7 +31,8 @@ func TestAggregatePipelineFailureWithoutDirectJobsHasSafePacket(t *testing.T) {
 	kind, pipelineID, sourceSHA, webURL := "branch", "9", strings.Repeat("a", 40), "https://gitlab.example/pipelines/9"
 	env := api.Envelope{
 		Stack: &api.Stack{
-			Remote: api.Remote{Name: "origin"},
+			Remote:   api.Remote{Name: "origin"},
+			Selector: api.Selector{Kind: "named_stack", Value: testStackName},
 			Members: []api.Member{{
 				Position: 0, IID: 1,
 				Pipeline: &api.Pipeline{
@@ -69,7 +69,7 @@ func TestCheckMergeabilityPrecedesReady(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			repo, _, mainOID, sourceOID, _ := createStackRepository(t)
-			mrs, err := json.Marshal([]map[string]any{{
+			payload := []map[string]any{{
 				"iid": 1, "state": "opened", "source_branch": "feature/one", "target_branch": "main",
 				"sha": sourceOID, "web_url": "https://gitlab.example/group/project/-/merge_requests/1",
 				"author": map[string]any{"id": 7, "username": "developer"},
@@ -77,25 +77,20 @@ func TestCheckMergeabilityPrecedesReady(t *testing.T) {
 					"base_sha": mainOID, "head_sha": sourceOID, "start_sha": mainOID,
 				},
 				"detailed_merge_status": tt.status, "has_conflicts": tt.conflicts,
-			}})
-			if err != nil {
-				t.Fatal(err)
-			}
+			}}
+			stateDir, stacksDir := testDirs(t)
+			responses := glabProjectResponses(false)
+			addPerMREndpoints(responses, payload)
 			now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 			handler := &Handler{
-				Runner: fakeGlabRunner{responses: map[string]json.RawMessage{
-					"/version": json.RawMessage(`{"version":"18.11.2"}`),
-					"/projects/group%2Fproject": json.RawMessage(`{
-						"id":42,"path_with_namespace":"group/project",
-						"web_url":"https://gitlab.example/group/project","default_branch":"main",
-						"only_allow_merge_if_pipeline_succeeds":false
-					}`),
-					"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
-				}},
-				Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
-				Now: func() time.Time { return now },
+				Runner:    fakeGlabRunner{responses: responses},
+				Dir:       repo,
+				StateDir:  stateDir,
+				StacksDir: stacksDir,
+				Now:       func() time.Time { return now },
 			}
-			result := runMachine(t, handler, "check", "feature/one")
+			registerNamedStack(t, handler, testStackName, 1)
+			result := runMachine(t, handler, "check", testStackName)
 			if result.exit != 0 {
 				t.Fatalf("exit=%d output=%s", result.exit, result.stdout)
 			}
@@ -117,7 +112,7 @@ func TestCheckMergeabilityPrecedesReady(t *testing.T) {
 					t.Fatal(err)
 				}
 				now = now.Add(5 * time.Minute)
-				repeated := runMachine(t, handler, "check", "feature/one")
+				repeated := runMachine(t, handler, "check", testStackName)
 				var second struct {
 					Findings []api.Finding `json:"findings"`
 				}
@@ -192,43 +187,38 @@ func TestCheckPipelineEvidenceIsSchemaValidForValidAndAmbiguousMergedResults(t *
 		t.Run(tt.name, func(t *testing.T) {
 			repo, _, mainOID, sourceOID, _ := createStackRepository(t)
 			syntheticOID := strings.Repeat("c", 40)
-			mrs, err := json.Marshal([]map[string]any{{
+			payload := []map[string]any{{
 				"iid": 1, "state": "opened", "source_branch": "feature/one", "target_branch": "main",
 				"sha": sourceOID, "web_url": "https://gitlab.example/group/project/-/merge_requests/1",
 				"author":        map[string]any{"id": 7, "username": "developer"},
 				"diff_refs":     map[string]any{"base_sha": mainOID, "head_sha": sourceOID, "start_sha": mainOID},
 				"head_pipeline": map[string]any{"id": 9},
-			}})
-			if err != nil {
-				t.Fatal(err)
-			}
+			}}
 			parentsJSON, err := json.Marshal(tt.parents(sourceOID, mainOID))
 			if err != nil {
 				t.Fatal(err)
 			}
+			stateDir, stacksDir := testDirs(t)
+			responses := glabProjectResponses(true)
+			addPerMREndpoints(responses, payload)
+			responses["/projects/42/pipelines/9"] = json.RawMessage(`{
+				"id":9,"sha":"` + syntheticOID + `","ref":"refs/merge-requests/1/merge",
+				"status":"success","source":"merge_request_event","web_url":"https://gitlab.example/pipelines/9"
+			}`)
+			responses["/projects/42/pipelines/9/merge_requests"] = json.RawMessage(tt.associated)
+			responses["/projects/42/repository/commits/"+syntheticOID] = json.RawMessage(
+				`{"id":"` + syntheticOID + `","parent_ids":` + string(parentsJSON) + `}`)
 			handler := &Handler{
-				Runner: fakeGlabRunner{responses: map[string]json.RawMessage{
-					"/version": json.RawMessage(`{"version":"18.11.2"}`),
-					"/projects/group%2Fproject": json.RawMessage(`{
-						"id":42,"path_with_namespace":"group/project",
-						"web_url":"https://gitlab.example/group/project","default_branch":"main",
-						"only_allow_merge_if_pipeline_succeeds":true
-					}`),
-					"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
-					"/projects/42/pipelines/9": json.RawMessage(`{
-						"id":9,"sha":"` + syntheticOID + `","ref":"refs/merge-requests/1/merge",
-						"status":"success","source":"merge_request_event","web_url":"https://gitlab.example/pipelines/9"
-					}`),
-					"/projects/42/pipelines/9/merge_requests": json.RawMessage(tt.associated),
-					"/projects/42/repository/commits/" + syntheticOID: json.RawMessage(
-						`{"id":"` + syntheticOID + `","parent_ids":` + string(parentsJSON) + `}`),
-				}},
-				Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
-				Now: func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
+				Runner:    fakeGlabRunner{responses: responses},
+				Dir:       repo,
+				StateDir:  stateDir,
+				StacksDir: stacksDir,
+				Now:       func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
 			}
+			registerNamedStack(t, handler, testStackName, 1)
 			var stdout, stderr bytes.Buffer
 			exit := cli.RunWithHandler([]string{
-				"--json", "--no-input", "--remote", "origin", "check", "feature/one",
+				"--json", "--no-input", "--remote", "origin", "check", testStackName,
 			}, &stdout, &stderr, handler)
 			if exit != 0 {
 				t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout.String(), stderr.String())
@@ -285,41 +275,34 @@ func TestCheckExactSourcePipelineDoesNotRequireMRAssociation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			repo, _, mainOID, sourceOID, _ := createStackRepository(t)
-			mrs, err := json.Marshal([]map[string]any{{
+			payload := []map[string]any{{
 				"iid": 1, "state": "opened", "source_branch": "feature/one", "target_branch": "main",
 				"sha": sourceOID, "web_url": "https://gitlab.example/group/project/-/merge_requests/1",
 				"author":        map[string]any{"id": 7, "username": "developer"},
 				"diff_refs":     map[string]any{"base_sha": mainOID, "head_sha": sourceOID, "start_sha": mainOID},
 				"head_pipeline": map[string]any{"id": 9},
-			}})
-			if err != nil {
-				t.Fatal(err)
-			}
+			}}
 			var calls [][]string
+			stateDir, stacksDir := testDirs(t)
+			responses := glabProjectResponses(true)
+			addPerMREndpoints(responses, payload)
+			responses["/projects/42/pipelines/9"] = json.RawMessage(`{
+				"id":9,"sha":"` + sourceOID + `","ref":"` + tt.refForIID(1) + `",
+				"status":"success","source":"` + tt.source + `",
+				"web_url":"https://gitlab.example/pipelines/9"
+			}`)
 			handler := &Handler{
 				Runner: fakeGlabRunner{
-					calls: &calls,
-					responses: map[string]json.RawMessage{
-						"/version": json.RawMessage(`{"version":"18.11.2"}`),
-						"/projects/group%2Fproject": json.RawMessage(`{
-							"id":42,"path_with_namespace":"group/project",
-							"web_url":"https://gitlab.example/group/project","default_branch":"main",
-							"only_allow_merge_if_pipeline_succeeds":true
-						}`),
-						"/projects/42/merge_requests?state=all&scope=all&per_page=100": mrs,
-						"/projects/42/pipelines/9": json.RawMessage(`{
-							"id":9,"sha":"` + sourceOID + `","ref":"` + tt.refForIID(1) + `",
-							"status":"success","source":"` + tt.source + `",
-							"web_url":"https://gitlab.example/pipelines/9"
-						}`),
-					},
+					calls:     &calls,
+					responses: responses,
 				},
-				Dir: repo, StateDir: filepath.Join(t.TempDir(), "state"),
+				Dir: repo, StateDir: stateDir, StacksDir: stacksDir,
 				Now: func() time.Time { return time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC) },
 			}
+			registerNamedStack(t, handler, testStackName, 1)
 			var stdout, stderr bytes.Buffer
 			exit := cli.RunWithHandler([]string{
-				"--json", "--no-input", "--remote", "origin", "check", "feature/one",
+				"--json", "--no-input", "--remote", "origin", "check", testStackName,
 			}, &stdout, &stderr, handler)
 			if exit != 0 {
 				t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout.String(), stderr.String())
