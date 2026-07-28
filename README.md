@@ -74,40 +74,35 @@ install -m 0755 "mrstack_${VERSION#v}_${os}_${arch}/mrstack" /usr/local/bin/mrst
 
 ## Agent Skill
 
-`mrstack` ships an [Agent Skill](https://agentskills.io) that teaches any
-compatible coding agent (Cursor, Claude Code, OpenAI Codex, Gemini CLI, Goose,
-OpenCode, …) how to operate `mrstack` in machine mode — the check → restack →
+`mrstack` ships an [Agent Skill](https://agentskills.io) that teaches coding
+agents how to operate `mrstack` in machine mode — the check → restack →
 recheck loop, interpreting dispositions/findings, executing remediation
 actions verbatim, and honoring the safety invariants.
 
-### Install the skill
-
-One-liner (auto-detects the agent client):
-
-```sh
-curl -sSL https://raw.githubusercontent.com/nkaewam/mrstack/main/skills/install.sh | bash
-```
-
-Or pin a client:
+Install it with the [Vercel Skills CLI](https://vercel.com/docs/agent-resources/skills)
+(works with Cursor, Claude Code, Codex, Copilot, Goose, OpenCode, and 18+
+other agents):
 
 ```sh
-curl -sSL https://raw.githubusercontent.com/nkaewam/mrstack/main/skills/install.sh | bash -s -- --client claude
+npx skills add nkaewam/mrstack
 ```
 
-Supported clients: `cursor`, `claude`, `codex`, `opencode`, `goose`, `agents`.
-Run `./skills/install.sh --list` to see their install directories.
-
-### Manual install
+Install globally (available in every project):
 
 ```sh
-git clone --depth 1 https://github.com/nkaewam/mrstack.git /tmp/mrstack
-cp -r /tmp/mrstack/skills/mrstack ~/.cursor/skills/   # or your client's dir
-rm -rf /tmp/mrstack
+npx skills add nkaewam/mrstack -g
 ```
 
-The skill lives at [`skills/mrstack/`](skills/mrstack/) and validates against
-the [Agent Skills spec](https://agentskills.io/specification.md) (`skills-ref
-validate skills/mrstack` → `Valid skill`).
+Target a specific agent, or skip prompts in CI:
+
+```sh
+npx skills add nkaewam/mrstack -a cursor
+npx skills add nkaewam/mrstack -g -y
+```
+
+Browse skills at [skills.sh](https://skills.sh). The skill source lives at
+[`skills/mrstack/`](skills/mrstack/) and validates against the
+[Agent Skills spec](https://agentskills.io/specification.md).
 
 ## Quick start
 
