@@ -163,6 +163,11 @@ func TestReplayStopsAndRetainsManagedWorktreeOnConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := replayer.RemoveForce(context.Background(), worktree); err != nil {
+			t.Errorf("cleanup managed worktree: %v", err)
+		}
+	})
 	_, err = replayer.Replay(context.Background(), worktree, plan)
 	var stop *ReplayError
 	if !errors.As(err, &stop) || stop.Stop != StopConflict {
@@ -271,6 +276,11 @@ func emptyReplayFixture(t *testing.T) (*gitexec.Repository, Plan, Replayer, stri
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := replayer.RemoveForce(context.Background(), worktree); err != nil {
+			t.Errorf("cleanup managed worktree: %v", err)
+		}
+	})
 	return repo, plan, replayer, worktree
 }
 
